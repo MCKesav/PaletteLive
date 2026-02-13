@@ -324,11 +324,6 @@ main {
   cursor: pointer;
 }
 
-.toggle .slider {
-  display: none;
-  /* Using native checkbox instead */
-}
-
 .toggle .label {
   font-weight: 500;
 }

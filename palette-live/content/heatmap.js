@@ -31,7 +31,6 @@ const Heatmap = {
         Heatmap._cleanup();
 
         const elements = window.ShadowWalker.getAllElements();
-        const skipHex = new Set(['#ffffff', '#000000']);
 
         for (const el of elements) {
             try {
@@ -40,7 +39,6 @@ const Heatmap = {
                 if (!bg || window.ColorUtils.isTransparent(bg)) continue;
 
                 const hex = window.ColorUtils.rgbToHex(bg).toLowerCase();
-                if (skipHex.has(hex)) continue;
 
                 el.setAttribute('data-pl-heat', '');
                 el.style.setProperty('--pl-heat-color', hex);

@@ -217,32 +217,24 @@ const Extractor = {
     },
 
     // ── Helper: Scan Tailwind utility classes ──
+    // Tailwind-specific properties like shadow, gradient stops (from/to/via)
+    // are NOT covered by the main directProps scan, so we extract them here.
     _scanTailwindClasses: (el, style, colorMap) => {
         if (!el.className || typeof el.className !== 'string') return;
         const classes = el.className.split(/\s+/);
-        const twColorPattern = /^(bg|text|border|ring|outline|accent|fill|stroke|decoration|shadow|divide|from|to|via)-/;
+        const twExtraPattern = /^(ring|shadow|divide|from|to|via)-/;
 
         for (const cls of classes) {
-            if (twColorPattern.test(cls)) {
-                // This element uses Tailwind color utilities
-                // The computed style already captures the resolved color,
-                // but we make sure we scan the relevant property
-                if (cls.startsWith('bg-')) {
-                    Extractor._addComputedColor(style.backgroundColor, colorMap);
-                } else if (cls.startsWith('text-')) {
-                    Extractor._addComputedColor(style.color, colorMap);
-                } else if (cls.startsWith('border-')) {
+            if (twExtraPattern.test(cls)) {
+                // ring/outline utilities resolve to outline or box-shadow
+                if (cls.startsWith('ring-')) {
+                    Extractor._extractColorsFromCSSValue(style.boxShadow, colorMap);
+                } else if (cls.startsWith('shadow-')) {
+                    Extractor._extractColorsFromCSSValue(style.boxShadow, colorMap);
+                } else if (cls.startsWith('divide-')) {
                     Extractor._addComputedColor(style.borderTopColor, colorMap);
-                } else if (cls.startsWith('ring-') || cls.startsWith('outline-')) {
-                    Extractor._addComputedColor(style.outlineColor, colorMap);
-                } else if (cls.startsWith('accent-')) {
-                    try { Extractor._addComputedColor(style.accentColor, colorMap); } catch (e) { }
-                } else if (cls.startsWith('fill-')) {
-                    Extractor._addComputedColor(style.fill, colorMap);
-                } else if (cls.startsWith('stroke-')) {
-                    Extractor._addComputedColor(style.stroke, colorMap);
-                } else if (cls.startsWith('decoration-')) {
-                    Extractor._addComputedColor(style.textDecorationColor, colorMap);
+                } else if (cls.startsWith('from-') || cls.startsWith('to-') || cls.startsWith('via-')) {
+                    Extractor._extractColorsFromCSSValue(style.backgroundImage, colorMap);
                 }
             }
         }

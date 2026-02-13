@@ -17,6 +17,16 @@ document.addEventListener('DOMContentLoaded', () => {
     let currentVariables = [];
     let activeTabId = null;
     let selectedColor = null;
+    let activeSwatch = null; // Currently selected swatch DOM element
+    let _debounceTimer = null;
+
+    /** Debounce helper — delays fn execution until pause in calls */
+    function debounce(fn, delay) {
+        return (...args) => {
+            clearTimeout(_debounceTimer);
+            _debounceTimer = setTimeout(() => fn(...args), delay);
+        };
+    }
 
     // Initialize
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
@@ -27,6 +37,10 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     function requestPalette() {
+        if (!activeTabId) {
+            paletteList.innerHTML = '<div class="loading-state">No active tab found.</div>';
+            return;
+        }
         paletteList.innerHTML = '<div class="loading-state">Scanning page colors...</div>';
         chrome.tabs.sendMessage(activeTabId, { type: 'EXTRACT_PALETTE' }, (response) => {
             if (chrome.runtime.lastError) {
@@ -97,13 +111,14 @@ document.addEventListener('DOMContentLoaded', () => {
             swatch.title = `${color.value} (${color.count} uses)`;
             swatch.dataset.value = color.value;
 
-            swatch.addEventListener('click', () => openEditor(color));
+            swatch.addEventListener('click', () => openEditor(color, swatch));
             paletteList.appendChild(swatch);
         });
     }
 
-    function openEditor(color) {
+    function openEditor(color, swatchEl) {
         selectedColor = color;
+        activeSwatch = swatchEl || null;
         editorPanel.classList.remove('editor-hidden');
 
         // colorPicker only accepts 6-digit hex (#RRGGBB), ensure we conform
@@ -123,33 +138,33 @@ document.addEventListener('DOMContentLoaded', () => {
     function closeEditor() {
         editorPanel.classList.add('editor-hidden');
         selectedColor = null;
+        activeSwatch = null;
     }
 
     document.getElementById('close-editor').addEventListener('click', closeEditor);
 
-    colorPicker.addEventListener('input', (e) => {
-        const newValue = e.target.value;
-        selectedColorLabel.textContent = newValue;
-        updateContrast(newValue);
-
-        if (!selectedColor) return;
+    /** Send override to content script and persist (debounced internals) */
+    const sendOverride = debounce((newValue) => {
+        if (!selectedColor || !activeTabId) return;
 
         // Find if this color is mapped to a variable
         const variable = currentVariables.find(v => {
-            // Compare the variable's resolved value to the selected swatch value
             const varHex = ColorUtils.rgbToHex(v.value).toLowerCase();
             const selHex = selectedColor.value.toLowerCase();
             return varHex === selHex || v.value.toLowerCase() === selHex;
         });
 
         const payload = {};
+
+        // Always send raw override so literal-color elements get updated
+        payload.raw = {
+            original: selectedColor.value,
+            current: newValue
+        };
+
+        // Also update CSS variable if one matches (covers elements using the variable)
         if (variable) {
             payload.variables = { [variable.name]: newValue };
-        } else {
-            payload.raw = {
-                original: selectedColor.value,
-                current: newValue
-            };
         }
 
         // Send override to content script
@@ -168,11 +183,13 @@ document.addEventListener('DOMContentLoaded', () => {
                     if (!newData.overrides) newData.overrides = {};
                     if (!newData.overrides.variables) newData.overrides.variables = {};
 
+                    // Always save raw override
+                    if (!newData.overrides.raw) newData.overrides.raw = {};
+                    newData.overrides.raw[selectedColor.value.toLowerCase()] = newValue;
+
+                    // Also save variable override if matched
                     if (variable) {
                         newData.overrides.variables[variable.name] = newValue;
-                    } else {
-                        if (!newData.overrides.raw) newData.overrides.raw = {};
-                        newData.overrides.raw[selectedColor.value.toLowerCase()] = newValue;
                     }
                     newData.timestamp = new Date().toISOString();
                     StorageUtils.savePalette(domain, newData);
@@ -181,6 +198,20 @@ document.addEventListener('DOMContentLoaded', () => {
         } catch (err) {
             console.warn('Error saving palette:', err);
         }
+    }, 60);
+
+    colorPicker.addEventListener('input', (e) => {
+        const newValue = e.target.value;
+        selectedColorLabel.textContent = newValue;
+        updateContrast(newValue);
+
+        // Update the active swatch visually so the grid reflects the change
+        if (activeSwatch) {
+            activeSwatch.style.backgroundColor = newValue;
+            activeSwatch.title = `${newValue} (edited)`;
+        }
+
+        sendOverride(newValue);
     });
 
     function updateContrast(color) {
@@ -218,6 +249,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     resetBtn.addEventListener('click', () => {
+        if (!activeTabId) return;
         chrome.tabs.sendMessage(activeTabId, { type: 'RESET_STYLES' })
             .catch(() => console.warn('Could not reach content script for RESET_STYLES'));
         closeEditor();
@@ -252,7 +284,10 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!format) return;
 
         let output = '';
-        const dataToExport = currentVariables.length > 0 ? currentVariables : currentColors;
+        // Merge variables + colors: prefer variables, then append remaining colors
+        const varHexes = new Set(currentVariables.map(v => ColorUtils.rgbToHex(v.value).toLowerCase()));
+        const extraColors = currentColors.filter(c => !varHexes.has(c.value.toLowerCase()));
+        const dataToExport = [...currentVariables, ...extraColors];
 
         if (format === 'css') output = ExporterUtils.toCSS(dataToExport);
         else if (format === 'json') output = ExporterUtils.toJSON(dataToExport);
@@ -270,6 +305,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     heatmapToggle.addEventListener('change', (e) => {
+        if (!activeTabId) return;
         chrome.tabs.sendMessage(activeTabId, {
             type: 'TOGGLE_HEATMAP',
             payload: { active: e.target.checked }

@@ -8,6 +8,7 @@
     if (window.__paletteLiveLoaded) return;
     window.__paletteLiveLoaded = true;
 
+    
     console.log('PaletteLive content script loaded');
 
     // Track which elements map to which original color (for reliable re-coloring)
@@ -198,15 +199,32 @@
         window.StorageUtils.getPalette(domain).then(savedData => {
             if (savedData && savedData.overrides) {
                 console.log('Applying saved palette for', domain);
+                // Build element map first so inline-style overrides work
+                buildColorMap();
                 window.Injector.apply(savedData.overrides);
                 // Replay saved raw overrides (non-variable color changes)
                 if (savedData.overrides.raw) {
                     Object.entries(savedData.overrides.raw).forEach(([original, current]) => {
-                        applyRawOverrideFallback({ original, current });
+                        applyRawOverride({ original, current });
                     });
                 }
             }
         }).catch(() => { });
     }
+
+    // ── MutationObserver: rebuild color map when DOM changes significantly ──
+    // This keeps inline-style overrides working after SPA navigation or AJAX updates.
+    let _rebuildTimer = null;
+    const observer = new MutationObserver((mutations) => {
+        // Only react to added/removed nodes (not attribute changes from our own overrides)
+        const dominated = mutations.some(m => m.addedNodes.length > 0 || m.removedNodes.length > 0);
+        if (!dominated) return;
+        clearTimeout(_rebuildTimer);
+        _rebuildTimer = setTimeout(() => {
+            console.log('PaletteLive: DOM changed, rebuilding color map');
+            buildColorMap();
+        }, 800);
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
 
 })();
