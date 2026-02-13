@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PaletteLive</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+
+<body>
+  <div class="container">
+    <header class="app-header">
+      <div class="logo">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10"></circle>
+          <path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"></path>
+          <path d="M2 12h20"></path>
+        </svg>
+        <span>PaletteLive</span>
+      </div>
+      <button id="reset-btn" class="icon-btn" title="Reset All Overrides">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="23 4 23 10 17 10"></polyline>
+          <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+        </svg>
+      </button>
+    </header>
+
+    <main>
+      <div id="palette-list" class="palette-grid">
+        <!-- Palette items injected here -->
+        <div class="loading-state">Scanning page colors...</div>
+      </div>
+
+      <div id="editor-panel" class="editor-panel editor-hidden">
+        <div class="editor-header">
+          <h3 id="selected-color-label">#000000</h3>
+          <button id="close-editor" class="icon-btn">&times;</button>
+        </div>
+
+        <div class="color-picker-container">
+          <input type="color" id="color-picker" value="#000000">
+        </div>
+
+        <div class="contrast-checker">
+          <h4>Contrast Check</h4>
+          <div class="contrast-result">
+            <span id="contrast-ratio">4.5:1</span>
+            <span id="contrast-rating" class="badge">AA</span>
+          </div>
+          <p class="contrast-context">Against white (default)</p>
+        </div>
+      </div>
+    </main>
+
+    <footer class="app-footer">
+      <div class="actions">
+        <button id="scan-btn" class="btn primary">Rescan</button>
+        <div class="dropdown">
+          <button id="export-btn" class="btn secondary">Export</button>
+          <div id="export-menu" class="dropdown-content">
+            <button data-format="css">CSS Variables</button>
+            <button data-format="json">JSON Tokens</button>
+            <button data-format="tailwind">Tailwind Config</button>
+          </div>
+        </div>
+      </div>
+      <div class="toggles">
+        <label class="toggle" title="Show Heatmap">
+          <input type="checkbox" id="heatmap-toggle">
+          <span class="slider"></span>
+          <span class="label">Heatmap</span>
+        </label>
+      </div>
+    </footer>
+  </div>
+
+  <script src="../utils/colorUtils.js"></script>
+  <script src="../utils/contrast.js"></script>
+  <script src="../utils/storage.js"></script>
+  <script src="../utils/exporter.js"></script>
+  <script src="popup.js"></script>
+</body>
+
+</html>
