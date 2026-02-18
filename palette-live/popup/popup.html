@@ -12,71 +12,183 @@
   <div class="container">
     <header class="app-header">
       <div class="logo">
-        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          aria-hidden="true">
           <circle cx="12" cy="12" r="10"></circle>
           <path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"></path>
           <path d="M2 12h20"></path>
         </svg>
         <span>PaletteLive</span>
       </div>
-      <button id="reset-btn" class="icon-btn" title="Reset All Overrides">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <polyline points="23 4 23 10 17 10"></polyline>
-          <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
-        </svg>
-      </button>
+      <div class="header-actions">
+        <button id="power-toggle" class="icon-btn power-btn" title="Enable/Disable PaletteLive on this site" aria-label="Toggle extension">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path>
+            <line x1="12" y1="2" x2="12" y2="12"></line>
+          </svg>
+        </button>
+        <button id="undo-btn" class="icon-btn" title="Undo Last Change" aria-label="Undo Last Change" disabled>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            aria-hidden="true">
+            <path d="M9 14 4 9l5-5"></path>
+            <path d="M4 9h11a5 5 0 0 1 0 10h-1"></path>
+          </svg>
+        </button>
+        <button id="reset-btn" class="icon-btn" title="Reset All Overrides" aria-label="Reset All Overrides">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            aria-hidden="true">
+            <polyline points="23 4 23 10 17 10"></polyline>
+            <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+          </svg>
+        </button>
+      </div>
     </header>
 
+    <div id="disabled-banner" class="disabled-banner hidden">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+        stroke-linecap="round" stroke-linejoin="round">
+        <path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path>
+        <line x1="12" y1="2" x2="12" y2="12"></line>
+      </svg>
+      <span>PaletteLive is <strong>paused</strong> on this site. Click the power button to resume.</span>
+    </div>
+
     <main>
-      <div id="palette-list" class="palette-grid">
-        <!-- Palette items injected here -->
+      <section class="palette-mode-controls" aria-label="Palette view mode">
+        <div class="palette-mode-row">
+          <label class="palette-mode-label" for="palette-mode-select">Palette</label>
+          <select id="palette-mode-select" class="palette-mode-select" aria-label="Palette type">
+            <option value="60-30-10" selected>60-30-10 Rule</option>
+            <option value="monochromatic">Monochromatic</option>
+            <option value="analogous">Analogous</option>
+            <option value="complementary">Complementary</option>
+            <option value="split-complementary">Split-Complementary</option>
+            <option value="triadic">Triadic</option>
+            <option value="advanced">Advanced (All Colors)</option>
+            <option value="apply-palette">Apply Palette</option>
+          </select>
+        </div>
+      </section>
+
+      <section id="advanced-controls" class="cluster-controls hidden" aria-label="Palette clustering controls">
+        <label class="cluster-toggle-row" for="cluster-toggle">
+          <input type="checkbox" id="cluster-toggle" checked>
+          Merge similar shades
+        </label>
+        <div class="cluster-threshold-row">
+          <span class="cluster-threshold-label">ΔE₀₀</span>
+          <input type="range" id="cluster-threshold" min="1" max="20" step="1" value="5"
+            aria-label="Cluster sensitivity">
+          <span id="cluster-threshold-value" class="cluster-threshold-value">5</span>
+        </div>
+        <div id="cluster-summary" class="cluster-summary hidden" aria-live="polite"></div>
+      </section>
+
+      <section id="apply-palette-controls" class="apply-palette-controls hidden" aria-label="Apply custom palette">
+        <p class="apply-palette-hint">Paste 3–8 hex colors (e.g. <code>#264653, #2a9d8f, #e9c46a</code>) or a Coolors URL.</p>
+        <textarea id="apply-palette-input" class="apply-palette-input" rows="3" placeholder="#264653, #2a9d8f, #e9c46a, #f4a261, #e76f51"></textarea>
+        <div class="apply-palette-preview" id="apply-palette-preview"></div>
+        <div class="apply-palette-presets">
+          <span class="apply-palette-presets-label">Presets:</span>
+          <button class="preset-btn" data-preset="ocean"     title="Deep blue → teal → sand">Ocean</button>
+          <button class="preset-btn" data-preset="sunset"    title="Warm oranges & reds">Sunset</button>
+          <button class="preset-btn" data-preset="forest"    title="Earthy greens">Forest</button>
+          <button class="preset-btn" data-preset="mono"      title="Clean neutrals">Mono</button>
+          <button class="preset-btn" data-preset="candy"     title="Vibrant pastels">Candy</button>
+          <button class="preset-btn" data-preset="midnight"  title="Dark mode colors">Midnight</button>
+        </div>
+        <div class="apply-palette-actions">
+          <button id="apply-palette-btn" class="btn primary apply-btn" disabled>Apply to Page</button>
+          <button id="apply-palette-reset" class="btn secondary" title="Remove palette overrides">Reset</button>
+        </div>
+        <div id="apply-palette-status" class="apply-palette-status hidden" aria-live="polite"></div>
+      </section>
+
+      <div id="palette-summary" class="palette-summary hidden" aria-live="polite"></div>
+
+      <div id="palette-list" class="palette-container">
         <div class="loading-state">Scanning page colors...</div>
       </div>
 
-      <div id="editor-panel" class="editor-panel editor-hidden">
-        <div class="editor-header">
-          <h3 id="selected-color-label">#000000</h3>
-          <button id="close-editor" class="icon-btn">&times;</button>
-        </div>
-
-        <div class="color-picker-container">
-          <input type="color" id="color-picker" value="#000000">
-        </div>
-
-        <div class="contrast-checker">
-          <h4>Contrast Check</h4>
-          <div class="contrast-result">
-            <span id="contrast-ratio">4.5:1</span>
-            <span id="contrast-rating" class="badge">AA</span>
-          </div>
-          <p class="contrast-context">Against white (default)</p>
-        </div>
-      </div>
     </main>
 
     <footer class="app-footer">
       <div class="actions">
         <button id="scan-btn" class="btn primary">Rescan</button>
+        <button id="force-reapply-btn" class="btn reapply" title="Force re-apply all color changes to the page">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21.5 2v6h-6"></path>
+            <path d="M2.5 22v-6h6"></path>
+            <path d="M2.5 12a10 10 0 0 1 16.4-6.2L21.5 8"></path>
+            <path d="M21.5 12a10 10 0 0 1-16.4 6.2L2.5 16"></path>
+          </svg>
+          Reapply
+        </button>
+        <button id="dropper-btn" class="btn dropper" title="Pick a color from the page">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M2 22l1-1h3l9-9"></path>
+            <path d="M3 21v-3l9-9"></path>
+            <path d="M14.5 5.5l4-4a1.414 1.414 0 0 1 2 0l2 2a1.414 1.414 0 0 1 0 2l-4 4"></path>
+            <path d="M12 8l4 4"></path>
+          </svg>
+          Pick
+        </button>
         <div class="dropdown">
           <button id="export-btn" class="btn secondary">Export</button>
           <div id="export-menu" class="dropdown-content">
             <button data-format="css">CSS Variables</button>
             <button data-format="json">JSON Tokens</button>
             <button data-format="tailwind">Tailwind Config</button>
+            <button data-format="cmyk">CMYK</button>
+            <button data-format="lab">LAB</button>
+            <button data-format="oklch">OKLCH</button>
+            <button id="import-btn" data-action="import">Import Palette File</button>
+            <div id="export-history" class="export-history hidden" role="region" aria-label="Recent exports"></div>
           </div>
         </div>
       </div>
+
       <div class="toggles">
         <label class="toggle" title="Show Heatmap">
           <input type="checkbox" id="heatmap-toggle">
           <span class="slider"></span>
           <span class="label">Heatmap</span>
         </label>
+
+        <label class="toggle" title="Before/After Compare">
+          <input type="checkbox" id="compare-toggle">
+          <span class="slider"></span>
+          <span class="label">Compare</span>
+        </label>
+
+        <span id="compare-status" class="compare-status" aria-live="polite"></span>
+
+        <label class="scheme-label" for="scheme-select">Theme</label>
+        <select id="scheme-select" class="scheme-select" aria-label="Theme Mode">
+          <option value="auto">Auto</option>
+          <option value="light">Light</option>
+          <option value="dark">Dark</option>
+        </select>
+
+        <label class="scheme-label" for="vision-select">Vision</label>
+        <select id="vision-select" class="scheme-select" aria-label="Color Blind Simulation">
+          <option value="none">Off</option>
+          <option value="protanopia">Protanopia</option>
+          <option value="deuteranopia">Deuteranopia</option>
+          <option value="tritanopia">Tritanopia</option>
+          <option value="achromatopsia">Achromatopsia</option>
+        </select>
       </div>
     </footer>
   </div>
 
+  <input type="file" id="import-input" accept=".json,.css,.js,.txt" class="hidden-file-input">
+
   <script src="../utils/colorUtils.js"></script>
+  <script src="../utils/colorNames.js"></script>
   <script src="../utils/contrast.js"></script>
   <script src="../utils/storage.js"></script>
   <script src="../utils/exporter.js"></script>

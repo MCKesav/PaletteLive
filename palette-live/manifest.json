@@ -6,7 +6,8 @@
   "permissions": [
     "activeTab",
     "scripting",
-    "storage"
+    "storage",
+    "sidePanel"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -20,6 +21,9 @@
       "128": "assets/icon128.png"
     }
   },
+  "side_panel": {
+    "default_path": "sidepanel/sidepanel.html"
+  },
   "background": {
     "service_worker": "background.js"
   },
@@ -30,12 +34,14 @@
       ],
       "js": [
         "utils/colorUtils.js",
+        "utils/colorNames.js",
         "utils/contrast.js",
         "utils/storage.js",
         "content/shadowWalker.js",
         "content/extractor.js",
         "content/injector.js",
         "content/heatmap.js",
+        "content/dropper.js",
         "content/content.js"
       ],
       "all_frames": true,

@@ -3,6 +3,13 @@
  * Handles CSS injection for live editing.
  */
 
+// Guard against re-injection - use version to allow updates
+const _INJECTOR_VERSION = 2;
+if (window._injectorVersion === _INJECTOR_VERSION) {
+  // Already loaded with same version
+} else {
+  window._injectorVersion = _INJECTOR_VERSION;
+
 const Injector = {
     styleId: 'palettelive-overrides',
 
@@ -73,3 +80,5 @@ const Injector = {
 };
 
 window.Injector = Injector;
+
+} // end re-injection guard

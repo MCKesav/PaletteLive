@@ -3,6 +3,13 @@
  * Calculates WCAG contrast ratios.
  */
 
+// Guard against re-injection - use version to allow updates
+const _CONTRAST_UTILS_VERSION = 2;
+if (window._contrastUtilsVersion === _CONTRAST_UTILS_VERSION) {
+  // Already loaded with same version
+} else {
+  window._contrastUtilsVersion = _CONTRAST_UTILS_VERSION;
+
 const ContrastUtils = {
     /**
      * Calculates contrast ratio between two colors
@@ -33,3 +40,5 @@ const ContrastUtils = {
 
 if (typeof module !== 'undefined') module.exports = ContrastUtils;
 else window.ContrastUtils = ContrastUtils;
+
+} // end re-injection guard
