@@ -3,6 +3,10 @@
  */
 
 document.addEventListener('DOMContentLoaded', () => {
+    // Clean up stale saved popup size from earlier version
+    chrome.storage.local.remove('palettelive_popup_size');
+
+
     const paletteList = document.getElementById('palette-list');
     const resetBtn = document.getElementById('reset-btn');
     const undoBtn = document.getElementById('undo-btn');
@@ -27,6 +31,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const applyPaletteBtn = document.getElementById('apply-palette-btn');
     const applyPaletteReset = document.getElementById('apply-palette-reset');
     const applyPaletteStatus = document.getElementById('apply-palette-status');
+    const hintAuto = document.getElementById('apply-palette-hint-auto');
+    const hintManual = document.getElementById('apply-palette-hint-manual');
     const clusterToggle = document.getElementById('cluster-toggle');
     const clusterThreshold = document.getElementById('cluster-threshold');
     const clusterThresholdValue = document.getElementById('cluster-threshold-value');
@@ -287,6 +293,38 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    /**
+     * Send a message to the content script with a timeout.
+     * Resolves with { ok, response, error } — never rejects.
+     * If the content script doesn't respond within `ms`, resolves as failed.
+     */
+    function sendMessageWithTimeout(message, ms = 15000) {
+        return new Promise(resolve => {
+            if (!activeTabId) {
+                resolve({ ok: false, error: 'No active tab.' });
+                return;
+            }
+            let settled = false;
+            const timer = setTimeout(() => {
+                if (!settled) {
+                    settled = true;
+                    resolve({ ok: false, error: 'Timed out waiting for content script.' });
+                }
+            }, ms);
+
+            chrome.tabs.sendMessage(activeTabId, message, { frameId: 0 }, response => {
+                if (settled) return; // already timed out
+                settled = true;
+                clearTimeout(timer);
+                if (chrome.runtime.lastError) {
+                    resolve({ ok: false, error: chrome.runtime.lastError.message });
+                } else {
+                    resolve({ ok: true, response });
+                }
+            });
+        });
+    }
+
     const persistLocks = new Map();
 
     function acquirePersistLock(domain) {
@@ -327,6 +365,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 enabled: !!clusterToggle.checked,
                 threshold: Number(clusterThreshold.value) || 5
             };
+            data.settings.paletteMode = paletteModeSelect.value;
+            data.settings.applyPaletteInput = applyPaletteInput.value || '';
             data.timestamp = new Date().toISOString();
 
             await StorageUtils.savePalette(domain, data);
@@ -767,12 +807,12 @@ document.addEventListener('DOMContentLoaded', () => {
     //  Apply Palette – preset definitions
     // ════════════════════════════════════════════════
     const PALETTE_PRESETS = {
-        ocean:    ['#264653','#2a9d8f','#e9c46a','#f4a261','#e76f51'],
-        sunset:   ['#ffb703','#fb8500','#e63946','#1d3557','#f1faee'],
-        forest:   ['#283618','#606c38','#dda15e','#fefae0','#bc6c25'],
-        mono:     ['#212529','#495057','#adb5bd','#dee2e6','#f8f9fa'],
-        candy:    ['#ff6b6b','#feca57','#48dbfb','#ff9ff3','#54a0ff'],
-        midnight: ['#0d1b2a','#1b263b','#415a77','#778da9','#e0e1dd']
+        ocean: ['#264653', '#2a9d8f', '#e9c46a', '#f4a261', '#e76f51'],
+        sunset: ['#ffb703', '#fb8500', '#e63946', '#1d3557', '#f1faee'],
+        forest: ['#283618', '#606c38', '#dda15e', '#fefae0', '#bc6c25'],
+        mono: ['#212529', '#495057', '#adb5bd', '#dee2e6', '#f8f9fa'],
+        candy: ['#ff6b6b', '#feca57', '#48dbfb', '#ff9ff3', '#54a0ff'],
+        midnight: ['#0d1b2a', '#1b263b', '#415a77', '#778da9', '#e0e1dd']
     };
 
     // ════════════════════════════════════════════════
@@ -804,12 +844,42 @@ document.addEventListener('DOMContentLoaded', () => {
     // ════════════════════════════════════════════════
 
     /**
-     * Strategy:
-     * 1. One aggressive cluster pass (ΔE₀₀ ≤ 20) to reduce page colors to a
-     *    manageable set, then trim to top-N by usage.
-     * 2. Sort both imported colors and page clusters by luminance.
-     * 3. Match 1-to-1 by luminance rank.
-     * 4. Each cluster's members get mapped to the matched imported color.
+     * Relative luminance (WCAG definition) for a hex color.
+     * Returns 0..1 where 0 = darkest, 1 = lightest.
+     */
+    function relativeLuminance(hex) {
+        const rgb = ColorUtils.hexToRgb(hex);
+        const srgb = [rgb.r, rgb.g, rgb.b].map(c => {
+            c = c / 255;
+            return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+        });
+        return 0.2126 * srgb[0] + 0.7152 * srgb[1] + 0.0722 * srgb[2];
+    }
+
+    /** WCAG contrast ratio between two hex colors (1..21) */
+    function contrastRatio(hex1, hex2) {
+        const l1 = relativeLuminance(hex1);
+        const l2 = relativeLuminance(hex2);
+        const lighter = Math.max(l1, l2);
+        const darker = Math.min(l1, l2);
+        return (lighter + 0.05) / (darker + 0.05);
+    }
+
+    /**
+     * Strategy – Contrast-Relationship Preservation (v3)
+     *
+     * The previous category-based BG/FG split failed when a single color
+     * served both roles (e.g. white = card background AND text on teal).
+     *
+     * New approach:
+     * 1. Cluster page colors (ΔE₀₀ ≤ 20).
+     * 2. Map ALL clusters → imported colors by luminance proximity (1:1).
+     * 3. Detect every pair of original colors that had meaningful contrast
+     *    (CR ≥ 3:1) — these are the visual relationships to preserve.
+     * 4. For each broken pair (new CR < 3:1), adjust the "text-role" color
+     *    in the pair to an import that restores contrast, picking by best
+     *    contrast vs. the anchor while remaining as close in luminance as
+     *    possible to the original role.
      *
      * Returns: Array<{ from: string (page hex), to: string (imported hex) }>
      */
@@ -818,42 +888,206 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const N = importedHexes.length;
 
-        // Single aggressive cluster pass — much faster than iterating
+        // --- 1. Cluster ---
         const clusters = clusterPaletteColors(pageColors, 20);
         let pageClusters = clusters.colors;
 
-        // If still more clusters than imported colors, take top N by count
+        // Trim to top-N by usage if too many
         if (pageClusters.length > N) {
             pageClusters = pageClusters
                 .sort((a, b) => (b.count || 0) - (a.count || 0))
                 .slice(0, N);
         }
 
-        // Compute luminance for each page cluster representative
-        const pageSorted = pageClusters
-            .map(c => {
-                const hex = normalizeHex(c.value);
-                const hsl = hexToHsl(hex);
-                return { ...c, hex, lum: hsl.l, hsl };
-            })
-            .sort((a, b) => a.lum - b.lum); // darkest first
+        // Enrich
+        const enriched = pageClusters.map(c => {
+            const hex = normalizeHex(c.value);
+            const lum = hexToHsl(hex).l;
+            return { ...c, hex, lum };
+        });
 
-        // Compute luminance for imported colors
-        const importSorted = importedHexes
+        // --- 2. Initial assignment: luminance-proximity 1:1 mapping ---
+        const importPool = importedHexes
             .map(hex => ({ hex: hex.toLowerCase(), lum: hexToHsl(hex).l }))
-            .sort((a, b) => a.lum - b.lum); // darkest first
+            .sort((a, b) => a.lum - b.lum);
 
-        // Build mappings: cluster members → imported color (1-to-1 by rank)
+        const sortedPage = [...enriched].sort((a, b) => a.lum - b.lum);
+        const mapping = new Map(); // original page hex → import hex
+        const usedIdx = new Set();
+
+        sortedPage.forEach(pc => {
+            let bestIdx = -1, bestDist = Infinity;
+            for (let i = 0; i < importPool.length; i++) {
+                if (usedIdx.has(i)) continue;
+                const dist = Math.abs(importPool[i].lum - pc.lum);
+                if (dist < bestDist) { bestDist = dist; bestIdx = i; }
+            }
+            // Fallback: allow reuse if all imports are taken
+            if (bestIdx < 0) {
+                for (let i = 0; i < importPool.length; i++) {
+                    const dist = Math.abs(importPool[i].lum - pc.lum);
+                    if (dist < bestDist) { bestDist = dist; bestIdx = i; }
+                }
+            }
+            if (bestIdx >= 0) {
+                mapping.set(pc.hex, importPool[bestIdx].hex);
+                usedIdx.add(bestIdx);
+            }
+        });
+
+        // --- 3. Detect broken contrast relationships ---
+        const MIN_ORIG_CR = 3.0;   // original pair must have had at least this
+        const MIN_NEW_CR = 3.0;   // minimum acceptable after mapping
+        const TARGET_CR = 4.5;   // ideal WCAG AA target
+
+        // Collect all pairs that had meaningful contrast originally
+        // but are now broken after mapping.
+        const brokenPairs = [];
+        for (let i = 0; i < sortedPage.length; i++) {
+            for (let j = i + 1; j < sortedPage.length; j++) {
+                const origCR = contrastRatio(sortedPage[i].hex, sortedPage[j].hex);
+                if (origCR < MIN_ORIG_CR) continue;
+
+                const mA = mapping.get(sortedPage[i].hex);
+                const mB = mapping.get(sortedPage[j].hex);
+                if (!mA || !mB) continue;
+
+                const newCR = contrastRatio(mA, mB);
+                if (newCR >= MIN_NEW_CR) continue; // still OK
+
+                brokenPairs.push({
+                    a: sortedPage[i],   // darker (lower lum)
+                    b: sortedPage[j],   // lighter (higher lum)
+                    origCR,
+                    newCR
+                });
+            }
+        }
+
+        // Sort by severity: worst contrast gaps first
+        brokenPairs.sort((x, y) => x.newCR - y.newCR);
+
+        // Build a quick lookup: for each page hex, which other page hexes
+        // had meaningful original contrast with it? (i.e. they're visual partners)
+        const contrastPartners = new Map(); // hex → Set of partner hexes
+        for (let i = 0; i < sortedPage.length; i++) {
+            for (let j = i + 1; j < sortedPage.length; j++) {
+                const origCR = contrastRatio(sortedPage[i].hex, sortedPage[j].hex);
+                if (origCR < MIN_ORIG_CR) continue;
+                if (!contrastPartners.has(sortedPage[i].hex)) contrastPartners.set(sortedPage[i].hex, new Set());
+                if (!contrastPartners.has(sortedPage[j].hex)) contrastPartners.set(sortedPage[j].hex, new Set());
+                contrastPartners.get(sortedPage[i].hex).add(sortedPage[j].hex);
+                contrastPartners.get(sortedPage[j].hex).add(sortedPage[i].hex);
+            }
+        }
+
+        // --- 4. Fix broken pairs (multi-partner aware) ---
+        for (const pair of brokenPairs) {
+            const mA = mapping.get(pair.a.hex);
+            const mB = mapping.get(pair.b.hex);
+            // Re-check (a prior fix may have already repaired this pair)
+            if (contrastRatio(mA, mB) >= MIN_NEW_CR) continue;
+
+            // Decide which color to adjust ("text-role"):
+            //  - If one has text in its categories, adjust that one
+            //  - Otherwise adjust the one with lower usage count (likely text)
+            const aCats = pair.a.categories || [];
+            const bCats = pair.b.categories || [];
+            const aIsText = aCats.includes('text');
+            const bIsText = bCats.includes('text');
+
+            let adjustKey, anchorKey;
+            if (aIsText && !bIsText) {
+                adjustKey = pair.a.hex; anchorKey = pair.b.hex;
+            } else if (bIsText && !aIsText) {
+                adjustKey = pair.b.hex; anchorKey = pair.a.hex;
+            } else {
+                // Both or neither have text role → adjust the lower-count one
+                const aCnt = pair.a.count || 0;
+                const bCnt = pair.b.count || 0;
+                if (aCnt <= bCnt) {
+                    adjustKey = pair.a.hex; anchorKey = pair.b.hex;
+                } else {
+                    adjustKey = pair.b.hex; anchorKey = pair.a.hex;
+                }
+            }
+
+            const currentMapped = mapping.get(adjustKey);
+
+            // Gather ALL partners of the adjustable color (not just the current anchor)
+            const partners = contrastPartners.get(adjustKey) || new Set();
+            const partnerMapped = []; // mapped hexes of all partners
+            for (const p of partners) {
+                const m = mapping.get(p);
+                if (m) partnerMapped.push(m);
+            }
+            // Ensure the current anchor is included
+            const anchorMapped = mapping.get(anchorKey);
+            if (anchorMapped && !partnerMapped.includes(anchorMapped)) {
+                partnerMapped.push(anchorMapped);
+            }
+
+            // Find the best import that maximizes the WORST contrast across ALL partners
+            const adjustCluster = enriched.find(c => c.hex === adjustKey);
+            const origLum = adjustCluster ? adjustCluster.lum : 50;
+
+            let bestIdx = -1, bestScore = -Infinity;
+            for (let i = 0; i < importPool.length; i++) {
+                // Compute worst contrast against all partners
+                let worstCR = Infinity;
+                for (const pm of partnerMapped) {
+                    worstCR = Math.min(worstCR, contrastRatio(importPool[i].hex, pm));
+                }
+                if (worstCR < MIN_NEW_CR && partnerMapped.length > 0) continue; // fails at least one partner
+
+                // Score: worst-case contrast quality + luminance proximity bonus
+                const crBonus = Math.min(worstCR, TARGET_CR * 1.5) * 10;
+                const lumPenalty = Math.abs(importPool[i].lum - origLum) * 0.3;
+                const score = crBonus - lumPenalty;
+                if (score > bestScore) { bestScore = score; bestIdx = i; }
+            }
+
+            // Fallback: if NO import passes MIN_NEW_CR for ALL partners,
+            // pick the one with best worst-case contrast anyway
+            if (bestIdx < 0) {
+                let maxWorstCR = 0;
+                for (let i = 0; i < importPool.length; i++) {
+                    let worstCR = Infinity;
+                    for (const pm of partnerMapped) {
+                        worstCR = Math.min(worstCR, contrastRatio(importPool[i].hex, pm));
+                    }
+                    if (worstCR > maxWorstCR) { maxWorstCR = worstCR; bestIdx = i; }
+                }
+            }
+
+            if (bestIdx >= 0) {
+                // Only swap if it genuinely improves the worst case
+                let currentWorstCR = Infinity;
+                for (const pm of partnerMapped) {
+                    currentWorstCR = Math.min(currentWorstCR, contrastRatio(currentMapped, pm));
+                }
+                const newWorstCR = (() => {
+                    let w = Infinity;
+                    for (const pm of partnerMapped) {
+                        w = Math.min(w, contrastRatio(importPool[bestIdx].hex, pm));
+                    }
+                    return w;
+                })();
+                if (newWorstCR > currentWorstCR) {
+                    mapping.set(adjustKey, importPool[bestIdx].hex);
+                }
+            }
+        }
+
+        // --- 5. Build final mappings (include cluster members) ---
         const mappings = [];
-        pageSorted.forEach((pageCluster, idx) => {
-            const importedIdx = Math.min(idx, importSorted.length - 1);
-            const toHex = importSorted[importedIdx].hex;
-            // Map the representative
-            mappings.push({ from: pageCluster.hex, to: toHex });
-            // Map all cluster members
-            if (pageCluster.clusterMembers) {
-                pageCluster.clusterMembers.forEach(member => {
-                    if (member !== pageCluster.hex) {
+        enriched.forEach(cluster => {
+            const toHex = mapping.get(cluster.hex);
+            if (!toHex) return;
+            mappings.push({ from: cluster.hex, to: toHex });
+            if (cluster.clusterMembers) {
+                cluster.clusterMembers.forEach(member => {
+                    if (member !== cluster.hex) {
                         mappings.push({ from: normalizeHex(member), to: toHex });
                     }
                 });
@@ -866,7 +1100,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // ════════════════════════════════════════════════
     //  Apply Palette – bulk apply
     // ════════════════════════════════════════════════
-    async function bulkApplyMappings(mappings) {
+    async function bulkApplyMappings(mappings, importedPaletteHexes) {
         if (!mappings.length || !activeTabId) return 0;
 
         const rawOverrides = [];
@@ -890,11 +1124,18 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!rawOverrides.length) return 0;
 
         // Use bulk override path — single DOM walk in content script
+        // Include the full imported palette for text contrast enforcement
+        const allPaletteHexes = importedPaletteHexes && importedPaletteHexes.length
+            ? [...new Set([...importedPaletteHexes.map(h => h.toLowerCase()),
+            ...rawOverrides.map(r => r.current)])]
+            : rawOverrides.map(r => r.current);
+
         const applyResult = await sendMessageToTab({
             type: 'APPLY_OVERRIDE_BULK',
             payload: {
                 raw: rawOverrides,
-                variables: Object.keys(variableUpdates).length ? variableUpdates : undefined
+                variables: Object.keys(variableUpdates).length ? variableUpdates : undefined,
+                paletteHexes: allPaletteHexes
             }
         });
 
@@ -911,24 +1152,304 @@ document.addEventListener('DOMContentLoaded', () => {
             Object.entries(variableUpdates).forEach(([name, value]) => {
                 data.overrides.variables[name] = value;
             });
+            // Persist the full palette hex array for text contrast enforcement after refresh
+            data.appliedPaletteHexes = allPaletteHexes;
         });
 
         return count;
     }
 
     // ════════════════════════════════════════════════
+    //  Apply Palette – mapping mode state
+    // ════════════════════════════════════════════════
+    let _paletteMappingMode = 'auto'; // 'auto' | 'manual'
+    let _manualOrderedHexes = [];     // user-reordered list in manual mode
+
+    const ROLE_LABELS = ['Primary', 'Secondary', 'Bg', 'Text', 'Accent'];
+
+    // Luminance helper for label contrast
+    function _chipLabelDark(hex) {
+        const rgb = ColorUtils.hexToRgb(hex);
+        if (!rgb) return false;
+        const l = (0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b) / 255;
+        return l > 0.55;
+    }
+
+    // Mapping mode tab wiring
+    document.querySelectorAll('.mapping-mode-tab').forEach(tab => {
+        tab.addEventListener('click', () => {
+            _paletteMappingMode = tab.dataset.mode;
+            document.querySelectorAll('.mapping-mode-tab').forEach(t => t.classList.toggle('active', t.dataset.mode === _paletteMappingMode));
+            hintAuto.classList.toggle('hidden', _paletteMappingMode !== 'auto');
+            hintManual.classList.toggle('hidden', _paletteMappingMode !== 'manual');
+            // Re-render preview with new mode
+            const hexes = parseApplyPaletteInput(applyPaletteInput.value);
+            if (hexes.length) renderApplyPreview(hexes);
+        });
+    });
+
+    // ════════════════════════════════════════════════
     //  Apply Palette – UI wiring
     // ════════════════════════════════════════════════
     function renderApplyPreview(hexes) {
         applyPalettePreview.innerHTML = '';
-        hexes.forEach(hex => {
+        if (_paletteMappingMode === 'manual') {
+            // Sync ordered list (preserve user reorder if same length)
+            if (_manualOrderedHexes.length !== hexes.length) {
+                _manualOrderedHexes = [...hexes];
+            }
+            applyPalettePreview.classList.add('manual-mode');
+            _renderManualChips();
+        } else {
+            applyPalettePreview.classList.remove('manual-mode');
+            hexes.forEach((hex, idx) => {
+                const chip = document.createElement('div');
+                chip.className = 'preview-chip';
+                chip.style.backgroundColor = hex;
+                chip.title = `${hex} — click to change`;
+                chip.style.cursor = 'pointer';
+
+                // Hidden color picker input
+                const picker = document.createElement('input');
+                picker.type = 'color';
+                picker.value = hex.length === 4 ? _expandShortHex(hex) : hex.substring(0, 7);
+                picker.style.cssText = 'position:absolute;width:0;height:0;opacity:0;pointer-events:none;';
+                chip.appendChild(picker);
+
+                chip.addEventListener('click', () => picker.click());
+                picker.addEventListener('input', (e) => {
+                    const newHex = e.target.value;
+                    chip.style.backgroundColor = newHex;
+                    chip.title = `${newHex} — click to change`;
+                    // Update the main hex array and sync textarea
+                    const currentHexes = parseApplyPaletteInput(applyPaletteInput.value);
+                    if (currentHexes[idx]) {
+                        currentHexes[idx] = newHex;
+                        applyPaletteInput.value = currentHexes.join(', ');
+                    }
+                });
+
+                applyPalettePreview.appendChild(chip);
+            });
+        }
+        applyPaletteBtn.disabled = hexes.length < 2;
+    }
+
+    /** Expand 3-char shorthand hex (#abc → #aabbcc) */
+    function _expandShortHex(hex) {
+        if (hex.length === 4 && hex[0] === '#') {
+            return '#' + hex[1] + hex[1] + hex[2] + hex[2] + hex[3] + hex[3];
+        }
+        return hex;
+    }
+
+    function _renderManualChips() {
+        applyPalettePreview.innerHTML = '';
+        let dragSrcIdx = null;
+
+        _manualOrderedHexes.forEach((hex, idx) => {
             const chip = document.createElement('div');
             chip.className = 'preview-chip';
             chip.style.backgroundColor = hex;
-            chip.title = hex;
+            chip.title = `${hex} — click to change, drag to reorder`;
+            chip.draggable = true;
+            chip.dataset.idx = idx;
+
+            // Role label
+            const label = document.createElement('span');
+            label.className = 'chip-role-label' + (_chipLabelDark(hex) ? ' dark-text' : '');
+            label.textContent = ROLE_LABELS[idx] || String(idx + 1);
+            chip.appendChild(label);
+
+            // Hidden color picker input
+            const picker = document.createElement('input');
+            picker.type = 'color';
+            picker.value = hex.length === 4 ? _expandShortHex(hex) : hex.substring(0, 7);
+            picker.style.cssText = 'position:absolute;width:0;height:0;opacity:0;pointer-events:none;';
+            chip.appendChild(picker);
+
+            // Click to pick color (only if not dragging)
+            let _wasDragging = false;
+            chip.addEventListener('click', (e) => {
+                if (_wasDragging) { _wasDragging = false; return; }
+                if (e.target === picker) return;
+                picker.click();
+            });
+            picker.addEventListener('input', (e) => {
+                const newHex = e.target.value;
+                chip.style.backgroundColor = newHex;
+                chip.title = `${newHex} — click to change, drag to reorder`;
+                _manualOrderedHexes[idx] = newHex;
+                // Update label color for contrast
+                label.className = 'chip-role-label' + (_chipLabelDark(newHex) ? ' dark-text' : '');
+                // Sync textarea
+                applyPaletteInput.value = _manualOrderedHexes.join(', ');
+            });
+
+            // Drag events
+            chip.addEventListener('dragstart', e => {
+                dragSrcIdx = idx;
+                _wasDragging = true;
+                setTimeout(() => chip.classList.add('dragging'), 0);
+                e.dataTransfer.effectAllowed = 'move';
+            });
+            chip.addEventListener('dragend', () => {
+                chip.classList.remove('dragging');
+                applyPalettePreview.querySelectorAll('.preview-chip').forEach(c => c.classList.remove('drag-over'));
+                dragSrcIdx = null;
+            });
+            chip.addEventListener('dragover', e => {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = 'move';
+                applyPalettePreview.querySelectorAll('.preview-chip').forEach(c => c.classList.remove('drag-over'));
+                if (dragSrcIdx !== null && dragSrcIdx !== idx) chip.classList.add('drag-over');
+            });
+            chip.addEventListener('dragleave', () => chip.classList.remove('drag-over'));
+            chip.addEventListener('drop', e => {
+                e.preventDefault();
+                if (dragSrcIdx === null || dragSrcIdx === idx) return;
+                // Swap
+                const arr = [..._manualOrderedHexes];
+                [arr[dragSrcIdx], arr[idx]] = [arr[idx], arr[dragSrcIdx]];
+                _manualOrderedHexes = arr;
+                _renderManualChips();
+            });
+
             applyPalettePreview.appendChild(chip);
         });
-        applyPaletteBtn.disabled = hexes.length < 2;
+    }
+
+    // ════════════════════════════════════════════════
+    //  Apply Palette – manual role mapping (optimal)
+    // ════════════════════════════════════════════════
+    /**
+     * Cluster-aware role-based palette mapping.
+     *
+     * Order: [0]=Primary  [1]=Secondary  [2]=Background  [3]=Text  [4]=Accent
+     * Extra palette colors (>5) fill remaining unmatched clusters by distance.
+     *
+     * Strategy:
+     *  1. Cluster page colors by perceptual similarity (ΔE₀₀ ≤ 18) so that
+     *     whole shade families move together (e.g. all navy shades → new Primary).
+     *  2. Score each cluster for each semantic role using category weights + HSL.
+     *  3. Assign clusters to roles greedily (highest score wins, no re-use).
+     *     Secondary is forced to differ from Primary by ≥ 45° hue to avoid duplication.
+     *  4. Map every clusterMember hex → the assigned palette color.
+     *  5. Leftover palette slots auto-map remaining clusters by luminance proximity.
+     */
+    function manualMapPalette(orderedHexes, pageColors) {
+        if (!orderedHexes.length || !pageColors.length) return [];
+
+        // ── Step 1: cluster ──────────────────────────────────────────
+        const { colors: clusters } = clusterPaletteColors(pageColors, 18);
+
+        // ── Step 2: per-cluster HSL & combined category score ────────
+        const scored = clusters.map(cluster => {
+            const hex = normalizeHex(cluster.value);
+            const hsl = hexToHsl(hex);
+            const total = Math.max(cluster.count || 1, 1);
+
+            // Fraction of this cluster's count that belongs to each category
+            const cats = cluster.categoryTotals || {};
+            const bgFrac = (cats.background || 0) / total;
+            const textFrac = (cats.text || 0) / total;
+            const accentFrac = (cats.accent || 0) / total;
+            const borderFrac = (cats.border || 0) / total;
+            const chromaFrac = accentFrac + borderFrac;
+
+            return { cluster, hex, hsl, total, bgFrac, textFrac, accentFrac, borderFrac, chromaFrac };
+        });
+
+        // ── Role scorers ─────────────────────────────────────────────
+        // Higher = better match for that role.
+        const roleScores = {
+            // Primary: most visually dominant chromatic color (buttons, links, brand)
+            primary: s => s.chromaFrac * s.hsl.s * s.total,
+            // Secondary: similar to primary scoring but different hue (handled below)
+            secondary: s => s.chromaFrac * s.hsl.s * s.total,
+            // Background: dominant background region — prefers high luminance or low saturation
+            background: s => s.bgFrac * s.total * (s.hsl.l > 0.4 || s.hsl.s < 0.2 ? 1.6 : 0.7),
+            // Text: high text fraction, typically very dark or very light
+            text: s => s.textFrac * s.total * (s.hsl.l < 0.3 || s.hsl.l > 0.85 ? 1.8 : 0.8),
+            // Accent: remaining chromatic + border elements
+            accent: s => (s.accentFrac + s.borderFrac * 0.5) * s.hsl.s * s.total,
+        };
+
+        const ROLE_KEYS = ['primary', 'secondary', 'background', 'text', 'accent'];
+        const assignedClusters = new Map(); // clusterIndex → paletteHex
+        const usedClusterIdxs = new Set();
+
+        // ── Step 3: greedy role assignment ───────────────────────────
+        ROLE_KEYS.forEach((role, roleIdx) => {
+            const paletteHex = orderedHexes[roleIdx];
+            if (!paletteHex) return;
+
+            const scoreFn = roleScores[role];
+            let primaryHex = null; // for secondary hue-distance constraint
+
+            if (role === 'secondary') {
+                // Find which cluster was assigned Primary so we can enforce hue distance
+                const primaryPaletteHex = orderedHexes[0];
+                for (const [idx, hex] of assignedClusters) {
+                    if (hex === primaryPaletteHex) {
+                        primaryHex = scored[idx].hex;
+                        break;
+                    }
+                }
+            }
+
+            let bestIdx = -1, bestScore = -Infinity;
+            scored.forEach((s, idx) => {
+                if (usedClusterIdxs.has(idx)) return;
+                let score = scoreFn(s);
+
+                // Secondary must differ from Primary by ≥ 45° in hue
+                if (role === 'secondary' && primaryHex) {
+                    const hueDiff = absHueDist(s.hsl.h, hexToHsl(primaryHex).h);
+                    if (hueDiff < 45) score *= 0.05; // heavy penalty
+                }
+
+                if (score > bestScore) { bestScore = score; bestIdx = idx; }
+            });
+
+            if (bestIdx >= 0) {
+                assignedClusters.set(bestIdx, paletteHex.toLowerCase());
+                usedClusterIdxs.add(bestIdx);
+            }
+        });
+
+        // ── Step 4: extra palette colors → remaining clusters (luminance proximity) ──
+        if (orderedHexes.length > 5) {
+            const remainingIdxs = scored
+                .map((_, i) => i)
+                .filter(i => !usedClusterIdxs.has(i))
+                .sort((a, b) => (scored[b].total || 0) - (scored[a].total || 0));
+
+            orderedHexes.slice(5).forEach((extraHex, offset) => {
+                const idx = remainingIdxs[offset];
+                if (idx != null) {
+                    assignedClusters.set(idx, extraHex.toLowerCase());
+                    usedClusterIdxs.add(idx);
+                }
+            });
+        }
+
+        // ── Step 5: build final from→to mappings (whole clusters move together) ──
+        const mappings = [];
+        const mapped = new Set();
+
+        assignedClusters.forEach((paletteHex, clusterIdx) => {
+            const cluster = scored[clusterIdx].cluster;
+            const members = Array.isArray(cluster.clusterMembers) ? cluster.clusterMembers : [normalizeHex(cluster.value)];
+            members.forEach(memberHex => {
+                const from = memberHex.toLowerCase();
+                if (mapped.has(from) || from === paletteHex) return;
+                mapped.add(from);
+                mappings.push({ from, to: paletteHex });
+            });
+        });
+
+        return mappings;
     }
 
     function setApplyStatus(text, isError) {
@@ -955,6 +1476,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const preset = PALETTE_PRESETS[name];
             if (!preset) return;
             applyPaletteInput.value = preset.join(', ');
+            _manualOrderedHexes = [...preset]; // reset order on new preset
             renderApplyPreview(preset);
             setApplyStatus('');
             // Highlight active preset
@@ -965,7 +1487,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Apply button
     applyPaletteBtn.addEventListener('click', async () => {
-        const hexes = parseApplyPaletteInput(applyPaletteInput.value);
+        const hexes = _paletteMappingMode === 'manual' ? _manualOrderedHexes : parseApplyPaletteInput(applyPaletteInput.value);
         if (hexes.length < 2) {
             setApplyStatus('Need at least 2 colors.', true);
             return;
@@ -979,13 +1501,16 @@ document.addEventListener('DOMContentLoaded', () => {
         setApplyStatus('');
 
         try {
-            const mappings = autoMapPalette(hexes, currentColors);
+            const mappings = _paletteMappingMode === 'manual'
+                ? manualMapPalette(hexes, currentColors)
+                : autoMapPalette(hexes, currentColors);
             if (!mappings.length) {
                 setApplyStatus('Could not map any colors.', true);
                 return;
             }
-            const applied = await bulkApplyMappings(mappings);
-            setApplyStatus(`Applied ${hexes.length}-color palette → ${applied} page colors remapped.`);
+            const applied = await bulkApplyMappings(mappings, hexes);
+            const modeLabel = _paletteMappingMode === 'manual' ? 'role-based' : 'auto';
+            setApplyStatus(`Applied ${hexes.length}-color palette (${modeLabel}) → ${applied} page colors remapped.`);
             renderPalette(currentColors);
         } catch (err) {
             console.warn('PaletteLive: Apply palette error', err);
@@ -1044,12 +1569,18 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         return [
-            { key: 'primary', label: 'Primary (60%)', icon: 'P', colors: primary,
-              desc: 'Dominant — backgrounds & large surfaces' },
-            { key: 'secondary', label: 'Secondary (30%)', icon: 'S', colors: secondary,
-              desc: 'Supporting — headers, sidebars, cards' },
-            { key: 'accent', label: 'Accent (10%)', icon: 'A', colors: accent,
-              desc: 'CTAs, links, alerts' }
+            {
+                key: 'primary', label: 'Primary (60%)', icon: 'P', colors: primary,
+                desc: 'Dominant — backgrounds & large surfaces'
+            },
+            {
+                key: 'secondary', label: 'Secondary (30%)', icon: 'S', colors: secondary,
+                desc: 'Supporting — headers, sidebars, cards'
+            },
+            {
+                key: 'accent', label: 'Accent (10%)', icon: 'A', colors: accent,
+                desc: 'CTAs, links, alerts'
+            }
         ];
     }
 
@@ -1063,8 +1594,10 @@ document.addEventListener('DOMContentLoaded', () => {
         // Find dominant hue from the most-used chromatic color
         const chromatic = enriched.filter(c => isChromatic(c.hsl));
         if (!chromatic.length) {
-            return [{ key: 'neutrals', label: 'Neutrals', icon: 'N', colors: merged,
-                       desc: 'No dominant hue detected — all neutrals' }];
+            return [{
+                key: 'neutrals', label: 'Neutrals', icon: 'N', colors: merged,
+                desc: 'No dominant hue detected — all neutrals'
+            }];
         }
 
         const dominantHue = chromatic[0].hsl.h;
@@ -1084,12 +1617,16 @@ document.addEventListener('DOMContentLoaded', () => {
         mono.sort((a, b) => b.hsl.l - a.hsl.l);
 
         const groups = [
-            { key: 'mono', label: `Monochromatic (${Math.round(dominantHue)}°)`, icon: 'M',
-              colors: mono, desc: 'Single-hue shades, tints & tones' }
+            {
+                key: 'mono', label: `Monochromatic (${Math.round(dominantHue)}°)`, icon: 'M',
+                colors: mono, desc: 'Single-hue shades, tints & tones'
+            }
         ];
         if (others.length) {
-            groups.push({ key: 'off-hue', label: 'Off-hue Colors', icon: 'O',
-                          colors: others, desc: 'Colors outside the dominant hue family' });
+            groups.push({
+                key: 'off-hue', label: 'Off-hue Colors', icon: 'O',
+                colors: others, desc: 'Colors outside the dominant hue family'
+            });
         }
         return groups;
     }
@@ -1104,8 +1641,10 @@ document.addEventListener('DOMContentLoaded', () => {
         const neutrals = enriched.filter(c => !isChromatic(c.hsl));
 
         if (chromatic.length < 2) {
-            return [{ key: 'all', label: 'All Colors', icon: 'A', colors: merged,
-                       desc: 'Not enough chromatic colors for analogous grouping' }];
+            return [{
+                key: 'all', label: 'All Colors', icon: 'A', colors: merged,
+                desc: 'Not enough chromatic colors for analogous grouping'
+            }];
         }
 
         const anchor = chromatic[0].hsl.h;
@@ -1121,16 +1660,22 @@ document.addEventListener('DOMContentLoaded', () => {
         analogous.sort((a, b) => a.hsl.h - b.hsl.h);
 
         const groups = [
-            { key: 'analogous', label: `Analogous (${Math.round(anchor - ANG)}°–${Math.round(anchor + ANG)}°)`,
-              icon: 'AN', colors: analogous, desc: 'Adjacent hues — natural & calming' }
+            {
+                key: 'analogous', label: `Analogous (${Math.round(anchor - ANG)}°–${Math.round(anchor + ANG)}°)`,
+                icon: 'AN', colors: analogous, desc: 'Adjacent hues — natural & calming'
+            }
         ];
         if (outside.length) {
-            groups.push({ key: 'contrast', label: 'Contrasting Colors', icon: 'C',
-                          colors: outside, desc: 'Hues outside the analogous range' });
+            groups.push({
+                key: 'contrast', label: 'Contrasting Colors', icon: 'C',
+                colors: outside, desc: 'Hues outside the analogous range'
+            });
         }
         if (neutrals.length) {
-            groups.push({ key: 'neutrals', label: 'Neutrals', icon: 'N',
-                          colors: neutrals, desc: 'Achromatic / low-saturation' });
+            groups.push({
+                key: 'neutrals', label: 'Neutrals', icon: 'N',
+                colors: neutrals, desc: 'Achromatic / low-saturation'
+            });
         }
         return groups;
     }
@@ -1145,8 +1690,10 @@ document.addEventListener('DOMContentLoaded', () => {
         const neutrals = enriched.filter(c => !isChromatic(c.hsl));
 
         if (chromatic.length < 2) {
-            return [{ key: 'all', label: 'All Colors', icon: 'A', colors: merged,
-                       desc: 'Not enough chromatic colors for complementary analysis' }];
+            return [{
+                key: 'all', label: 'All Colors', icon: 'A', colors: merged,
+                desc: 'Not enough chromatic colors for complementary analysis'
+            }];
         }
 
         const primaryHue = chromatic[0].hsl.h;
@@ -1164,20 +1711,28 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         const groups = [
-            { key: 'primary', label: `Primary Hue (${Math.round(primaryHue)}°)`, icon: 'P',
-              colors: primaryGroup, desc: 'Dominant hue family' }
+            {
+                key: 'primary', label: `Primary Hue (${Math.round(primaryHue)}°)`, icon: 'P',
+                colors: primaryGroup, desc: 'Dominant hue family'
+            }
         ];
         if (compGroup.length) {
-            groups.push({ key: 'complement', label: `Complement (${Math.round(compHue)}°)`, icon: 'C',
-                          colors: compGroup, desc: 'Opposite hue — high contrast & energy' });
+            groups.push({
+                key: 'complement', label: `Complement (${Math.round(compHue)}°)`, icon: 'C',
+                colors: compGroup, desc: 'Opposite hue — high contrast & energy'
+            });
         }
         if (others.length) {
-            groups.push({ key: 'others', label: 'Other Hues', icon: 'O', colors: others,
-                          desc: 'Neither primary nor complement' });
+            groups.push({
+                key: 'others', label: 'Other Hues', icon: 'O', colors: others,
+                desc: 'Neither primary nor complement'
+            });
         }
         if (neutrals.length) {
-            groups.push({ key: 'neutrals', label: 'Neutrals', icon: 'N', colors: neutrals,
-                          desc: 'Achromatic / low-saturation' });
+            groups.push({
+                key: 'neutrals', label: 'Neutrals', icon: 'N', colors: neutrals,
+                desc: 'Achromatic / low-saturation'
+            });
         }
         return groups;
     }
@@ -1192,8 +1747,10 @@ document.addEventListener('DOMContentLoaded', () => {
         const neutrals = enriched.filter(c => !isChromatic(c.hsl));
 
         if (chromatic.length < 2) {
-            return [{ key: 'all', label: 'All Colors', icon: 'A', colors: merged,
-                       desc: 'Not enough chromatic colors' }];
+            return [{
+                key: 'all', label: 'All Colors', icon: 'A', colors: merged,
+                desc: 'Not enough chromatic colors'
+            }];
         }
 
         const primaryHue = chromatic[0].hsl.h;
@@ -1210,24 +1767,34 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         const groups = [
-            { key: 'primary', label: `Primary (${Math.round(primaryHue)}°)`, icon: 'P',
-              colors: pGroup, desc: 'Dominant hue' }
+            {
+                key: 'primary', label: `Primary (${Math.round(primaryHue)}°)`, icon: 'P',
+                colors: pGroup, desc: 'Dominant hue'
+            }
         ];
         if (saGroup.length) {
-            groups.push({ key: 'split-a', label: `Split A (${Math.round(splitA)}°)`, icon: 'SA',
-                          colors: saGroup, desc: 'First split-complement' });
+            groups.push({
+                key: 'split-a', label: `Split A (${Math.round(splitA)}°)`, icon: 'SA',
+                colors: saGroup, desc: 'First split-complement'
+            });
         }
         if (sbGroup.length) {
-            groups.push({ key: 'split-b', label: `Split B (${Math.round(splitB)}°)`, icon: 'SB',
-                          colors: sbGroup, desc: 'Second split-complement' });
+            groups.push({
+                key: 'split-b', label: `Split B (${Math.round(splitB)}°)`, icon: 'SB',
+                colors: sbGroup, desc: 'Second split-complement'
+            });
         }
         if (others.length) {
-            groups.push({ key: 'others', label: 'Other Hues', icon: 'O', colors: others,
-                          desc: 'Outside split-complement zones' });
+            groups.push({
+                key: 'others', label: 'Other Hues', icon: 'O', colors: others,
+                desc: 'Outside split-complement zones'
+            });
         }
         if (neutrals.length) {
-            groups.push({ key: 'neutrals', label: 'Neutrals', icon: 'N', colors: neutrals,
-                          desc: 'Achromatic / low-saturation' });
+            groups.push({
+                key: 'neutrals', label: 'Neutrals', icon: 'N', colors: neutrals,
+                desc: 'Achromatic / low-saturation'
+            });
         }
         return groups;
     }
@@ -1242,8 +1809,10 @@ document.addEventListener('DOMContentLoaded', () => {
         const neutrals = enriched.filter(c => !isChromatic(c.hsl));
 
         if (chromatic.length < 2) {
-            return [{ key: 'all', label: 'All Colors', icon: 'A', colors: merged,
-                       desc: 'Not enough chromatic colors for triadic analysis' }];
+            return [{
+                key: 'all', label: 'All Colors', icon: 'A', colors: merged,
+                desc: 'Not enough chromatic colors for triadic analysis'
+            }];
         }
 
         const h1 = chromatic[0].hsl.h;
@@ -1260,24 +1829,34 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         const groups = [
-            { key: 'triad-1', label: `Triad A (${Math.round(h1)}°)`, icon: 'A',
-              colors: g1, desc: 'Dominant triad arm' }
+            {
+                key: 'triad-1', label: `Triad A (${Math.round(h1)}°)`, icon: 'A',
+                colors: g1, desc: 'Dominant triad arm'
+            }
         ];
         if (g2.length) {
-            groups.push({ key: 'triad-2', label: `Triad B (${Math.round(h2)}°)`, icon: 'B',
-                          colors: g2, desc: 'Second triad arm (+120°)' });
+            groups.push({
+                key: 'triad-2', label: `Triad B (${Math.round(h2)}°)`, icon: 'B',
+                colors: g2, desc: 'Second triad arm (+120°)'
+            });
         }
         if (g3.length) {
-            groups.push({ key: 'triad-3', label: `Triad C (${Math.round(h3)}°)`, icon: 'C',
-                          colors: g3, desc: 'Third triad arm (+240°)' });
+            groups.push({
+                key: 'triad-3', label: `Triad C (${Math.round(h3)}°)`, icon: 'C',
+                colors: g3, desc: 'Third triad arm (+240°)'
+            });
         }
         if (others.length) {
-            groups.push({ key: 'others', label: 'Other Hues', icon: 'O', colors: others,
-                          desc: 'Outside triadic zones' });
+            groups.push({
+                key: 'others', label: 'Other Hues', icon: 'O', colors: others,
+                desc: 'Outside triadic zones'
+            });
         }
         if (neutrals.length) {
-            groups.push({ key: 'neutrals', label: 'Neutrals', icon: 'N', colors: neutrals,
-                          desc: 'Achromatic / low-saturation' });
+            groups.push({
+                key: 'neutrals', label: 'Neutrals', icon: 'N', colors: neutrals,
+                desc: 'Achromatic / low-saturation'
+            });
         }
         return groups;
     }
@@ -1419,14 +1998,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
         let groups;
         switch (mode) {
-            case '60-30-10':           groups = analyze603010(colors); break;
-            case 'monochromatic':      groups = analyzeMonochromatic(colors); break;
-            case 'analogous':          groups = analyzeAnalogous(colors); break;
-            case 'complementary':      groups = analyzeComplementary(colors); break;
+            case '60-30-10': groups = analyze603010(colors); break;
+            case 'monochromatic': groups = analyzeMonochromatic(colors); break;
+            case 'analogous': groups = analyzeAnalogous(colors); break;
+            case 'complementary': groups = analyzeComplementary(colors); break;
             case 'split-complementary': groups = analyzeSplitComplementary(colors); break;
-            case 'triadic':            groups = analyzeTriadic(colors); break;
-            case 'apply-palette':      groups = analyze603010(colors); break;
-            default:                   groups = analyze603010(colors); break;
+            case 'triadic': groups = analyzeTriadic(colors); break;
+            case 'apply-palette': groups = analyze603010(colors); break;
+            default: groups = analyze603010(colors); break;
         }
 
         const modeLabel = mode === 'apply-palette' ? '60-30-10' : mode;
@@ -1944,7 +2523,23 @@ document.addEventListener('DOMContentLoaded', () => {
                 clusterThreshold.value = '5';
             }
 
+            // Restore palette mode
+            const validModes = ['60-30-10', 'monochromatic', 'analogous', 'complementary', 'split-complementary', 'triadic', 'advanced', 'apply-palette'];
+            if (data.settings.paletteMode && validModes.includes(data.settings.paletteMode)) {
+                paletteModeSelect.value = data.settings.paletteMode;
+            } else {
+                paletteModeSelect.value = 'apply-palette';
+            }
+
+            // Restore apply-palette input text & preview
+            if (data.settings.applyPaletteInput) {
+                applyPaletteInput.value = data.settings.applyPaletteInput;
+                const hexes = parseApplyPaletteInput(data.settings.applyPaletteInput);
+                if (hexes.length) renderApplyPreview(hexes);
+            }
+
             updateClusterControls();
+            updatePaletteModeUI();
             updateBatchApplyState();
         } catch (error) {
             console.warn('PaletteLive: Could not hydrate saved domain state', error);
@@ -1966,9 +2561,62 @@ document.addEventListener('DOMContentLoaded', () => {
             'content/content.js'
         ];
 
+        // Never inject into a still-loading tab — the scripts would run before
+        // the page's own JS, causing race conditions and "page not loading" issues.
+        const tab = await new Promise(resolve =>
+            chrome.tabs.get(activeTabId, t => resolve(t))
+        );
+        if (!tab || tab.status !== 'complete') {
+            throw new Error('Tab not ready for injection (status: ' + (tab ? tab.status : 'unknown') + ')');
+        }
+
         await chrome.scripting.executeScript({
             target: { tabId: activeTabId },
             files: scripts
+        });
+    }
+
+    /**
+     * Wait until the active tab's status is 'complete'.
+     * If it's already complete, resolves immediately.
+     * If it's still loading, listens for chrome.tabs.onUpdated.
+     * Rejects after `timeoutMs` milliseconds.
+     */
+    function waitForTabReady(timeoutMs = 10000) {
+        return new Promise((resolve, reject) => {
+            chrome.tabs.get(activeTabId, (tab) => {
+                if (chrome.runtime.lastError || !tab) {
+                    reject(new Error('Tab not found'));
+                    return;
+                }
+                if (tab.status === 'complete') {
+                    resolve();
+                    return;
+                }
+
+                // Tab is still loading — wait for it to complete
+                paletteList.innerHTML = '<div class="loading-state">Waiting for page to load…</div>';
+                let settled = false;
+
+                const timer = setTimeout(() => {
+                    if (settled) return;
+                    settled = true;
+                    chrome.tabs.onUpdated.removeListener(listener);
+                    reject(new Error('Timed out waiting for page to load'));
+                }, timeoutMs);
+
+                const listener = (tabId, changeInfo) => {
+                    if (tabId !== activeTabId) return;
+                    if (changeInfo.status === 'complete') {
+                        if (settled) return;
+                        settled = true;
+                        clearTimeout(timer);
+                        chrome.tabs.onUpdated.removeListener(listener);
+                        resolve();
+                    }
+                };
+                chrome.tabs.onUpdated.addListener(listener);
+            });
         });
     }
 
@@ -2062,22 +2710,17 @@ document.addEventListener('DOMContentLoaded', () => {
         renderClusterSummary(0, 0, 0);
         paletteList.innerHTML = '<div class="loading-state">Scanning page colors...</div>';
 
-        // Helper to send EXTRACT_PALETTE and get response
-        const extractPalette = () => new Promise((resolve) => {
-            chrome.tabs.sendMessage(activeTabId, { type: 'EXTRACT_PALETTE' }, { frameId: 0 }, response => {
-                if (chrome.runtime.lastError) {
-                    resolve({ ok: false, error: chrome.runtime.lastError.message });
-                } else {
-                    resolve({ ok: true, response });
-                }
-            });
-        });
+        // Helper to send EXTRACT_PALETTE and get response (with 15s timeout)
+        const extractPalette = () => sendMessageWithTimeout({ type: 'EXTRACT_PALETTE' }, 15000);
+
+        /** Check if a result is usable (not just ok, but has actual data) */
+        const isUsable = (r) => r.ok && r.response && (r.response.success !== false);
 
         // First attempt
         let result = await extractPalette();
 
-        // If first attempt fails, try injecting scripts and wait for ready
-        if (!result.ok) {
+        // If first attempt fails or returns empty, try injecting scripts and wait for ready
+        if (!isUsable(result)) {
             console.log('PaletteLive: Content script not responding, attempting injection...');
             try {
                 await injectContentScripts();
@@ -2094,9 +2737,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 // Retry extraction
                 result = await extractPalette();
 
-                if (!result.ok) {
+                if (!isUsable(result)) {
                     renderClusterSummary(0, 0, 0);
-                    paletteList.innerHTML = '<div class="loading-state">Could not connect to page.<br>Please refresh the page and try again.</div>';
+                    const errorMsg = (result.response && result.response.error)
+                        ? escapeHtml(result.response.error)
+                        : 'Could not connect to page.';
+                    paletteList.innerHTML = `<div class="loading-state">${errorMsg}<br>Please refresh the page and try again.</div>`;
                     return;
                 }
             } catch (injectError) {
@@ -2715,6 +3361,12 @@ document.addEventListener('DOMContentLoaded', () => {
         schemeSelect.value = 'auto';
         visionSelect.value = 'none';
 
+        // Clear apply-palette input & preview
+        applyPaletteInput.value = '';
+        applyPalettePreview.innerHTML = '';
+        applyPaletteBtn.disabled = true;
+        setApplyStatus('');
+
         renderClusterSummary(0, 0, 0);
         paletteList.innerHTML = '<div class="loading-state">Resetting and rescanning...</div>';
 
@@ -2732,41 +3384,36 @@ document.addEventListener('DOMContentLoaded', () => {
             payload: { active: false }
         });
 
-        // Helper to send RESET_AND_RESCAN and get response
-        const resetAndRescan = () => new Promise((resolve) => {
-            chrome.tabs.sendMessage(
-                activeTabId,
-                { type: 'RESET_AND_RESCAN', payload: { preserveScheme: false, preserveVision: false } },
-                { frameId: 0 },
-                response => {
-                    if (chrome.runtime.lastError) {
-                        resolve({ ok: false, error: chrome.runtime.lastError.message });
-                    } else {
-                        resolve({ ok: true, response });
-                    }
-                }
-            );
-        });
+        // Helper to send RESET_AND_RESCAN and get response (with 20s timeout)
+        const resetAndRescan = () => sendMessageWithTimeout(
+            { type: 'RESET_AND_RESCAN', payload: { preserveScheme: false, preserveVision: false } },
+            20000
+        );
 
         let result = await resetAndRescan();
 
-        // If failed, try injecting scripts and retry
-        if (!result.ok) {
-            try {
-                await injectContentScripts();
-                paletteList.innerHTML = '<div class="loading-state">Loading extension...</div>';
-                await waitForContentScriptReady(15, 200);
-                result = await resetAndRescan();
-            } catch (e) {
-                // Ignore injection error
+        // If failed or empty response, try injecting scripts and retry
+        if (!result.ok || !result.response || result.response.success === false) {
+            if (!result.ok) {
+                try {
+                    await injectContentScripts();
+                    paletteList.innerHTML = '<div class="loading-state">Loading extension...</div>';
+                    await waitForContentScriptReady(15, 200);
+                    result = await resetAndRescan();
+                } catch (e) {
+                    // Ignore injection error
+                }
             }
         }
 
         enableOperations();
 
-        if (!result.ok) {
+        if (!result.ok || !result.response) {
             renderClusterSummary(0, 0, 0);
-            paletteList.innerHTML = '<div class="loading-state">Could not connect to page.<br>Please refresh and try again.</div>';
+            const timeoutMsg = (!result.ok && result.error && result.error.includes('Timed out'))
+                ? 'Scan timed out — the page may be too complex.'
+                : 'Could not connect to page.';
+            paletteList.innerHTML = `<div class="loading-state">${timeoutMsg}<br>Please refresh and try again.</div>`;
             return;
         }
 
@@ -2797,37 +3444,34 @@ document.addEventListener('DOMContentLoaded', () => {
         renderClusterSummary(0, 0, 0);
         paletteList.innerHTML = '<div class="loading-state">Rescanning page colors...</div>';
 
-        // Helper to send RESCAN_ONLY and get response
-        const rescanPalette = () => new Promise((resolve) => {
-            chrome.tabs.sendMessage(activeTabId, { type: 'RESCAN_ONLY' }, { frameId: 0 }, response => {
-                if (chrome.runtime.lastError) {
-                    resolve({ ok: false, error: chrome.runtime.lastError.message });
-                } else {
-                    resolve({ ok: true, response });
-                }
-            });
-        });
+        // Helper to send RESCAN_ONLY and get response (with 20s timeout)
+        const rescanPalette = () => sendMessageWithTimeout({ type: 'RESCAN_ONLY' }, 20000);
 
         let result = await rescanPalette();
 
-        // If failed, try injecting scripts and retry
-        if (!result.ok) {
-            try {
-                await injectContentScripts();
-                paletteList.innerHTML = '<div class="loading-state">Loading extension...</div>';
-                await waitForContentScriptReady(15, 200);
-                result = await rescanPalette();
-            } catch (e) {
-                // Ignore injection error
+        // If failed or empty response, try injecting scripts and retry
+        if (!result.ok || !result.response || result.response.success === false) {
+            if (!result.ok) {
+                try {
+                    await injectContentScripts();
+                    paletteList.innerHTML = '<div class="loading-state">Loading extension...</div>';
+                    await waitForContentScriptReady(15, 200);
+                    result = await rescanPalette();
+                } catch (e) {
+                    // Ignore injection error
+                }
             }
         }
 
         enableOperations();
         scanBtn.disabled = false;
 
-        if (!result.ok) {
+        if (!result.ok || !result.response) {
             renderClusterSummary(0, 0, 0);
-            paletteList.innerHTML = '<div class="loading-state">Could not connect to page.<br>Please refresh and try again.</div>';
+            const timeoutMsg = (!result.ok && result.error && result.error.includes('Timed out'))
+                ? 'Scan timed out — the page may be too complex.'
+                : 'Could not connect to page.';
+            paletteList.innerHTML = `<div class="loading-state">${timeoutMsg}<br>Please refresh and try again.</div>`;
             return;
         }
 
@@ -2897,9 +3541,9 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             const tab = await chrome.tabs.get(activeTabId);
             if (tab && tab.url) {
-                try { return new URL(tab.url).hostname; } catch (_) {}
+                try { return new URL(tab.url).hostname; } catch (_) { }
             }
-        } catch (_) {}
+        } catch (_) { }
         return null;
     }
 
@@ -2937,13 +3581,13 @@ document.addEventListener('DOMContentLoaded', () => {
             try {
                 await chrome.action.setBadgeText({ text: 'OFF', tabId: activeTabId });
                 await chrome.action.setBadgeBackgroundColor({ color: '#ef4444', tabId: activeTabId });
-            } catch (_) {}
+            } catch (_) { }
         } else {
             // Resume — tell content script to restart
             await sendMessageToTab({ type: 'RESUME_EXTENSION' });
             try {
                 await chrome.action.setBadgeText({ text: '', tabId: activeTabId });
-            } catch (_) {}
+            } catch (_) { }
             // Re-scan the page
             await requestPalette();
         }
@@ -2960,6 +3604,41 @@ document.addEventListener('DOMContentLoaded', () => {
         activeTabId = tabs[0].id;
         activeWindowId = tabs[0].windowId;
 
+        // ── Navigation listener ──────────────────────────────────────
+        // When the user navigates to a new URL while the popup is open,
+        // show a "page navigated" notice and a Rescan button instead of
+        // showing stale data or a confusing error message.
+        let _lastSeenUrl = tabs[0].url || '';
+        const _navListener = (tabId, changeInfo, updatedTab) => {
+            if (tabId !== activeTabId) return;
+            // A real navigation: URL changed and new load completed
+            if (changeInfo.status === 'complete' && updatedTab.url &&
+                updatedTab.url !== _lastSeenUrl &&
+                !updatedTab.url.startsWith('chrome://') &&
+                !updatedTab.url.startsWith('chrome-extension://')) {
+                _lastSeenUrl = updatedTab.url;
+                // Reset UI but don't auto-rescan — let user trigger it to avoid
+                // interfering with the page's own load completion handlers.
+                currentColors = [];
+                currentVariables = [];
+                overrideState.clear();
+                renderClusterSummary(0, 0, 0);
+                paletteList.innerHTML =
+                    '<div class="loading-state">Page navigated.<br>' +
+                    '<button id="nav-rescan-btn" style="margin-top:8px;padding:4px 12px;' +
+                    'border-radius:6px;border:none;background:var(--accent,#6366f1);' +
+                    'color:#fff;cursor:pointer;font-size:13px;">Rescan</button></div>';
+                const navBtn = document.getElementById('nav-rescan-btn');
+                if (navBtn) navBtn.addEventListener('click', () => requestPalette());
+            }
+        };
+        chrome.tabs.onUpdated.addListener(_navListener);
+        // Clean up when popup closes
+        window.addEventListener('unload', () => {
+            chrome.tabs.onUpdated.removeListener(_navListener);
+        }, { once: true });
+        // ─────────────────────────────────────────────────
+
         // Check if extension is paused for this site
         const isPaused = await loadPausedState();
         updatePowerUI(isPaused);
@@ -2970,7 +3649,7 @@ document.addEventListener('DOMContentLoaded', () => {
             try {
                 await chrome.action.setBadgeText({ text: 'OFF', tabId: activeTabId });
                 await chrome.action.setBadgeBackgroundColor({ color: '#ef4444', tabId: activeTabId });
-            } catch (_) {}
+            } catch (_) { }
             return;
         }
 
@@ -2978,6 +3657,17 @@ document.addEventListener('DOMContentLoaded', () => {
         updatePaletteModeUI();
         updateBatchApplyState();
         setCompareStatus('');
+
+        // Wait for the tab to finish loading before sending any messages.
+        // Sending messages to a still-loading tab causes the content script
+        // to miss the injection window and the page can appear broken.
+        try {
+            await waitForTabReady(12000);
+        } catch (e) {
+            renderClusterSummary(0, 0, 0);
+            paletteList.innerHTML = '<div class="loading-state">Page is taking too long to load.<br>Please try again once it finishes loading.</div>';
+            return;
+        }
 
         await hydrateDomainState();
         await requestPalette();

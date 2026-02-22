@@ -380,6 +380,30 @@ if (window._colorUtilsVersion === _COLOR_UTILS_VERSION) {
     },
 
     /**
+     * Compare two colors for similarity within a tolerance.
+     * Useful for matching computed styles (which may drift slightly) against stored values.
+     * @param {string} color1 - First color
+     * @param {string} color2 - Second color
+     * @param {number} tolerance - Max Euclidean distance (0-442). Default 5.
+     * @returns {boolean}
+     */
+    areSimilar: (color1, color2, tolerance = 5) => {
+      if (!color1 || !color2) return false;
+      const rgb1 = ColorUtils.hexToRgb(ColorUtils.rgbToHex8(color1));
+      const rgb2 = ColorUtils.hexToRgb(ColorUtils.rgbToHex8(color2));
+
+      // Euclidean distance in RGBA space
+      const distance = Math.sqrt(
+        Math.pow(rgb1.r - rgb2.r, 2) +
+        Math.pow(rgb1.g - rgb2.g, 2) +
+        Math.pow(rgb1.b - rgb2.b, 2) +
+        Math.pow((rgb1.a - rgb2.a) * 255, 2) // Scale alpha to 0-255 range
+      );
+
+      return distance <= tolerance;
+    },
+
+    /**
      * Format a hex color for export, preserving alpha if present.
      * Returns rgba() string for translucent, hex for opaque.
      */

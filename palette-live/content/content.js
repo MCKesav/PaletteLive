@@ -66,6 +66,69 @@
     // Paused state — when true, all background activity is suspended
     let __plPaused = false;
 
+    // ── Image container detection ──────────────────────────────────
+    // Media tag names that display images/video — background-color overrides
+    // on these or their containers would hide their visual content.
+    const _MEDIA_TAGS = new Set(['IMG', 'VIDEO', 'CANVAS', 'PICTURE', 'SOURCE']);
+
+    /**
+     * Returns true if the element is a media element or directly wraps one
+     * (up to `depth` levels of descendants).  Used to skip background-color
+     * overrides that would obscure the image/video content.
+     */
+    function _isImageContainer(element) {
+        if (_MEDIA_TAGS.has(element.tagName)) return true;
+        // Also skip if element has a background-image url (image set via CSS)
+        try {
+            const bgImg = window.getComputedStyle(element).backgroundImage;
+            if (bgImg && bgImg !== 'none' && bgImg.includes('url(')) return true;
+        } catch (e) { /* ignore */ }
+        return _hasMediaDescendant(element, 3);
+    }
+
+    function _hasMediaDescendant(element, depth) {
+        if (depth <= 0) return false;
+        const children = element.children;
+        if (!children) return false;
+        for (let i = 0; i < children.length; i++) {
+            if (_MEDIA_TAGS.has(children[i].tagName)) return true;
+            if (_hasMediaDescendant(children[i], depth - 1)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * When a new media element (or subtree containing one) is added to the DOM,
+     * walk up the ancestor chain and remove any PaletteLive background-color
+     * overrides so the image/video is visible.
+     */
+    function _undoBgOverridesForMedia(mediaElement) {
+        let parent = mediaElement.parentElement;
+        for (let i = 0; i < 5 && parent && parent !== document.documentElement; i++) {
+            // Revert inline background-color override
+            const propMap = overrideMap.get(parent);
+            if (propMap && propMap.has('background-color')) {
+                const snapshot = propMap.get('background-color');
+                restoreInlineSnapshot(parent, 'background-color', snapshot);
+                propMap.delete('background-color');
+                // Also restore background-image if we cleared it
+                if (propMap.has('background-image')) {
+                    const bgImgSnap = propMap.get('background-image');
+                    restoreInlineSnapshot(parent, 'background-image', bgImgSnap);
+                    propMap.delete('background-image');
+                }
+                if (propMap.size === 0) overrideMap.delete(parent);
+            }
+            // Remove fallback CSS classes (pl-bg-*)
+            const toRemove = [];
+            parent.classList.forEach(cls => {
+                if (cls.startsWith('pl-bg-')) toRemove.push(cls);
+            });
+            toRemove.forEach(cls => parent.classList.remove(cls));
+            parent = parent.parentElement;
+        }
+    }
+
     // SPA watcher
     let observer = null;
     let rebuildTimer = null;
@@ -271,12 +334,16 @@
 
                 window.Extractor.scan()
                     .then(data => {
-                        buildColorMap();
+                        try {
+                            buildColorMap();
+                        } catch (mapError) {
+                            console.error('PaletteLive: buildColorMap error:', mapError);
+                        }
                         sendResponse({ success: true, data });
                     })
                     .catch(error => {
                         console.error('PaletteLive: Extraction failed:', error);
-                        sendResponse({ success: false, error: error.message });
+                        sendResponse({ success: false, error: error.message || 'Extraction failed' });
                     });
                 return true;
             }
@@ -301,11 +368,50 @@
                 }
                 const payload = request.payload || {};
                 const rawArray = Array.isArray(payload.raw) ? payload.raw : [];
+                // Set palette hexes BEFORE applying so the proactive
+                // _fixChildTextContrast helper has access during override application
+                if (Array.isArray(payload.paletteHexes) && payload.paletteHexes.length) {
+                    _lastPaletteHexes = payload.paletteHexes;
+                }
                 const appliedCount = applyBulkRawOverrides(rawArray);
 
                 // Apply variables in one go
                 if (payload.variables && window.Injector && typeof window.Injector.apply === 'function') {
                     window.Injector.apply({ variables: payload.variables });
+                }
+
+                // Post-apply: enforce text readability against effective backgrounds
+                if (Array.isArray(payload.paletteHexes) && payload.paletteHexes.length) {
+                    // Store for re-runs after reapplyAllOverrides / scroll
+                    _lastPaletteHexes = payload.paletteHexes;
+                    // Reset tracking for fresh palette application
+                    _textContrastFixed = new WeakSet();
+                    _flushContrastCache();
+                    // Three passes — each flushes the bg cache so post-override
+                    // backgrounds are read fresh (not stale pre-override values).
+                    // Pass 1 (150ms): after inline styles settle
+                    // Pass 2 (500ms): after CSS transitions complete
+                    // Pass 3 (idle):  after page fully idle
+                    setTimeout(() => {
+                        _bgCache = new WeakMap();
+                        enforceTextContrast(payload.paletteHexes);
+                    }, 150);
+                    setTimeout(() => {
+                        if (_lastPaletteHexes === payload.paletteHexes) {
+                            _bgCache = new WeakMap();
+                            enforceTextContrast(payload.paletteHexes);
+                        }
+                    }, 500);
+                    // Idle pass — fires when the browser has no urgent work
+                    const idleCb = typeof requestIdleCallback === 'function'
+                        ? requestIdleCallback
+                        : (fn) => setTimeout(fn, 2000);
+                    idleCb(() => {
+                        if (_lastPaletteHexes === payload.paletteHexes) {
+                            _bgCache = new WeakMap();
+                            enforceTextContrast(payload.paletteHexes);
+                        }
+                    }, { timeout: 3000 });
                 }
 
                 sendResponse({ success: true, appliedCount });
@@ -329,9 +435,14 @@
                     if (entries && entries.length) {
                         entries.forEach(({ element, cssProp }) => {
                             try {
+                                // Skip bg-color on image containers — would hide the image
+                                if (cssProp === 'background-color' && _isImageContainer(element)) return;
                                 element.style.setProperty(cssProp, currentHex, 'important');
                                 if (cssProp === 'background-color') {
-                                    element.style.setProperty('background-image', 'none', 'important');
+                                    const origBgImg = window.getComputedStyle(element).backgroundImage;
+                                    if (origBgImg && origBgImg !== 'none' && !origBgImg.includes('url(')) {
+                                        element.style.setProperty('background-image', 'none', 'important');
+                                    }
                                 }
                                 appliedCount++;
                             } catch (e) { /* ignore */ }
@@ -383,7 +494,11 @@
                 waitForStyleSettle()
                     .then(() => window.Extractor.scan())
                     .then(data => {
-                        buildColorMap();
+                        try {
+                            buildColorMap();
+                        } catch (mapError) {
+                            console.error('PaletteLive: buildColorMap error:', mapError);
+                        }
                         isRescanning = false;
                         flushPendingOverrides();
                         sendResponse({ success: true, data });
@@ -391,7 +506,7 @@
                     .catch(error => {
                         isRescanning = false;
                         flushPendingOverrides();
-                        sendResponse({ success: false, error: error.message });
+                        sendResponse({ success: false, error: error.message || 'Reset+rescan failed' });
                     });
                 return true;
             }
@@ -411,13 +526,15 @@
                 waitForStyleSettle()
                     .then(() => window.Extractor.scan())
                     .then(data => {
-                        // buildColorMap() already calls reapplyAllOverrides() internally,
-                        // which handles inline style re-application for all mapped elements.
-                        buildColorMap();
-                        // Refresh fallback CSS rules in one batch — NO per-override DOM walk.
-                        // Fallback classes from prior applications persist on elements;
-                        // we only need to update the injected <style> rules.
-                        batchRefreshFallbackCSS();
+                        try {
+                            // buildColorMap() already calls reapplyAllOverrides() internally,
+                            // which handles inline style re-application for all mapped elements.
+                            buildColorMap();
+                            // Refresh fallback CSS rules in one batch — NO per-override DOM walk.
+                            batchRefreshFallbackCSS();
+                        } catch (mapError) {
+                            console.error('PaletteLive: buildColorMap/fallback error:', mapError);
+                        }
                         isRescanning = false;
                         flushPendingOverrides();
                         // Restart background monitors
@@ -428,7 +545,7 @@
                         isRescanning = false;
                         flushPendingOverrides();
                         if (rawOverrideState.size > 0) startOverrideWatchdog();
-                        sendResponse({ success: false, error: error.message });
+                        sendResponse({ success: false, error: error.message || 'Rescan failed' });
                     });
                 return true;
             }
@@ -445,14 +562,18 @@
                             if (entries && entries.length) {
                                 entries.forEach(({ element, cssProp }) => {
                                     try {
+                                        if (cssProp === 'background-color' && _isImageContainer(element)) return;
                                         captureInlineSnapshot(element, cssProp);
                                         if (element.style.getPropertyPriority(cssProp) === 'important') {
                                             element.style.removeProperty(cssProp);
                                         }
                                         element.style.setProperty(cssProp, currentHex, 'important');
                                         if (cssProp === 'background-color') {
-                                            captureInlineSnapshot(element, 'background-image');
-                                            element.style.setProperty('background-image', 'none', 'important');
+                                            const origBgImg = window.getComputedStyle(element).backgroundImage;
+                                            if (origBgImg && origBgImg !== 'none' && !origBgImg.includes('url(')) {
+                                                captureInlineSnapshot(element, 'background-image');
+                                                element.style.setProperty('background-image', 'none', 'important');
+                                            }
                                         }
                                         applied++;
                                     } catch (e) { /* ignore */ }
@@ -612,6 +733,13 @@
                 if (!value || window.ColorUtils.isTransparent(value)) return;
                 if (value === 'auto' || value === 'initial' || value === 'inherit' || value === 'currentcolor' || value === 'currentColor') return;
 
+                // Skip reading 'color' from elements whose text was fixed by
+                // enforceTextContrast — the computed value is the contrast-fixed
+                // color (e.g. #ffffff), NOT the original page color.  Mapping it
+                // would pollute colorElementMap with phantom associations that
+                // cause wrong overrides on subsequent reapplyAllOverrides calls.
+                if (cssPropName === 'color' && el && _textContrastFixed.has(el)) return;
+
                 const hex = window.ColorUtils.rgbToHex8(value).toLowerCase();
                 if (!hex || (hex === '#000000' && value === 'rgba(0, 0, 0, 0)')) return;
 
@@ -625,9 +753,19 @@
             // Scan <html> first
             scanDocumentElement(addToMap);
 
+            // Cap total elements to avoid freezing on massive pages
+            let _mapElCount = 0;
+            const _MAP_EL_LIMIT = 5000;
             window.ShadowWalker.walk(document.body, (element) => {
+                if (_mapElCount >= _MAP_EL_LIMIT) return;
                 try {
+                    // Skip invisible elements — they don't contribute visible colors
+                    // and calling getComputedStyle on them is wasted work.
+                    if (element.offsetWidth === 0 && element.offsetHeight === 0) return;
+
                     const style = window.getComputedStyle(element);
+                    if (style.display === 'none' || style.visibility === 'hidden') return;
+
                     const addToMapEl = (value, cssPropName) => addToMap(value, cssPropName, element);
 
                     props.forEach(({ js, css }) => addToMapEl(style[js], css));
@@ -636,6 +774,7 @@
                     } catch (error) {
                         // Ignore unsupported accent-color contexts.
                     }
+                    _mapElCount++;
                 } catch (error) {
                     // Ignore style read errors.
                 }
@@ -696,12 +835,36 @@
                 entries.forEach(({ element, cssProp }) => {
                     try {
                         if (!element.isConnected) return;
+                        // Skip invisible elements — no need to reapply overrides
+                        if (element.offsetWidth === 0 && element.offsetHeight === 0) return;
 
+                        // Don't overwrite text color on elements fixed by enforceTextContrast
+                        if (cssProp === 'color' && _textContrastFixed.has(element)) return;
+
+                        // Cache getComputedStyle — avoids calling it twice per element
+                        const style = window.getComputedStyle(element);
                         const jsName = cssPropToJs(cssProp);
-                        const computedValue = window.getComputedStyle(element)[jsName];
+                        const computedValue = style[jsName];
                         if (computedValue) {
                             const computedHex = window.ColorUtils.rgbToHex8(computedValue).toLowerCase();
                             if (computedHex === currentHex) return;
+                        }
+
+                        if (cssProp === 'background-color' && _isImageContainer(element)) return;
+
+                        // Contrast guard: never re-apply a text color that would be
+                        // unreadable against the actual background (e.g. after a palette
+                        // was applied and enforceTextContrast fixed the contrast — the
+                        // watchdog / scroll-triggered reapply should not undo that fix).
+                        if (cssProp === 'color') {
+                            try {
+                                const effBg = _getEffectiveBg(element);
+                                if (_contrastRatio(currentHex, effBg) < 4.5) {
+                                    // Schedule contrast enforcement rather than blindly applying
+                                    _scheduleDeferredContrast();
+                                    return;
+                                }
+                            } catch (e) { /* ignore — proceed with reapply */ }
                         }
 
                         captureInlineSnapshot(element, cssProp);
@@ -709,8 +872,12 @@
                         element.style.setProperty(cssProp, currentHex, 'important');
 
                         if (cssProp === 'background-color') {
-                            captureInlineSnapshot(element, 'background-image');
-                            element.style.setProperty('background-image', 'none', 'important');
+                            // Reuse cached style object instead of calling getComputedStyle again
+                            const origBgImg = style.backgroundImage;
+                            if (origBgImg && origBgImg !== 'none' && !origBgImg.includes('url(')) {
+                                captureInlineSnapshot(element, 'background-image');
+                                element.style.setProperty('background-image', 'none', 'important');
+                            }
                         }
                         applied++;
                     } catch (error) {
@@ -721,6 +888,14 @@
 
             if (applied > 0) {
                 console.log(`PaletteLive: Re-applied overrides to ${applied} element-properties`);
+            }
+            // Re-run text contrast enforcement after reapply — but debounced
+            // to avoid cascading DOM walks.
+            if (_lastPaletteHexes && _lastPaletteHexes.length && applied > 0) {
+                clearTimeout(_textContrastRerunTimer);
+                _textContrastRerunTimer = setTimeout(() => {
+                    enforceTextContrast(_lastPaletteHexes);
+                }, 600);
             }
         });
     }
@@ -739,7 +914,10 @@
         rawOverrideState.forEach((currentHex, originalHex) => {
             const safeId = getSafeId(originalHex);
             const classMap = getFallbackClassMap(safeId);
-            allSelectors[`.${classMap.backgroundColor}`] = { 'background-color': currentHex, 'background-image': 'none' };
+            // Don't set background-image:none in the CSS rule — it would wipe
+            // gradients/images on ALL elements with this class.  Per-element
+            // inline guards are applied in applyRawOverrideFallback instead.
+            allSelectors[`.${classMap.backgroundColor}`] = { 'background-color': currentHex };
             allSelectors[`.${classMap.color}`] = { color: currentHex };
             allSelectors[`.${classMap.borderTopColor}`] = { 'border-top-color': currentHex };
             allSelectors[`.${classMap.borderRightColor}`] = { 'border-right-color': currentHex };
@@ -833,6 +1011,13 @@
         clearHighlight();
         hideComparisonOverlay();
         rawOverrideState.clear();
+
+        // Clear text contrast tracking
+        _textContrastFixed = new WeakSet();
+        _lastPaletteHexes = null;
+        clearTimeout(_textContrastRerunTimer);
+        clearTimeout(_deferredContrastTimer);
+        _flushContrastCache();
 
         if (!config.preserveScheme) {
             setColorScheme('auto');
@@ -950,53 +1135,62 @@
             let appliedCount = 0;
             let entries = colorElementMap.get(originalHex);
 
+            // Fuzzy match fallback if exact match fails
+            if (!entries || !entries.length) {
+                // Try to find similar colors in the map
+                const similarKeys = [];
+                for (const key of colorElementMap.keys()) {
+                    if (window.ColorUtils.areSimilar(key, originalHex, 10)) { // Tolerance of 10
+                        similarKeys.push(key);
+                    }
+                }
+
+                if (similarKeys.length > 0) {
+                    entries = [];
+                    similarKeys.forEach(key => {
+                        const keyEntries = colorElementMap.get(key);
+                        if (keyEntries) entries.push(...keyEntries);
+                    });
+                    console.log(`PaletteLive: Fuzzy matched ${similarKeys.length} colors for ${originalHex}`);
+                }
+            }
+
             // Debug logging and fallback rebuild
             if (!entries || !entries.length) {
-                console.warn(`PaletteLive: No elements found in color map for ${originalHex}. Map has ${colorElementMap.size} colors.`);
+                console.warn(`PaletteLive: No elements found in color map for ${originalHex} (even with fuzzy match). Map has ${colorElementMap.size} colors.`);
 
                 // Try to rebuild the color map in case the DOM has changed
                 console.log('PaletteLive: Rebuilding color map and retrying...');
-                // Note: buildColorMap calls reapplyAllOverrides which uses performDOMChange internally.
-                // Since we are already inside performDOMChange (and observer is stopped),
-                // the recursive call is safe and won't trigger observer.
-                // However, performDOMChange nests fine because we just stop/start.
-                // Wait... if I stop(), then inner call stops(), then inner call starts()...
-                // The outer start() will run at end.
-                // But inner start() will RESTART the observer while outer function is still running
-                // and potentially modifying DOM!
-                //
-                // FIX: performDOMChange needs to handle reentry or we should assume buildColorMap
-                // handles its own protection and we shouldn't wrap IT?
-                // But buildColorMap triggers mutation observer if NOT protected.
-                //
-                // Actually, buildColorMap calls reapplyAllOverrides.
-                // reapplyAllOverrides IS protected now.
-                // So buildColorMap itself doesn't modify DOM except via reapplyAllOverrides.
-                // EXCEPT: buildColorMap does NOT modify DOM. It *reads* DOM.
-                // So buildColorMap is safe.
-                //
-                // But wait, applyRawOverride calls applyRawOverrideFallback which modifes DOM.
 
                 buildColorMap();
                 entries = colorElementMap.get(originalHex);
-                if (entries && entries.length) {
-                    console.log(`PaletteLive: Found ${entries.length} elements after rebuild`);
-                } else {
-                    // Log some similar colors for debugging
-                    const similarColors = [];
-                    colorElementMap.forEach((value, key) => {
-                        if (key.startsWith(originalHex.substring(0, 4))) {
-                            similarColors.push(key);
+
+                // Retry fuzzy match after rebuild
+                if (!entries || !entries.length) {
+                    const similarKeys = [];
+                    for (const key of colorElementMap.keys()) {
+                        if (window.ColorUtils.areSimilar(key, originalHex, 10)) {
+                            similarKeys.push(key);
                         }
-                    });
-                    if (similarColors.length) {
-                        console.warn(`PaletteLive: Similar colors in map:`, similarColors.slice(0, 5));
+                    }
+                    if (similarKeys.length > 0) {
+                        entries = [];
+                        similarKeys.forEach(key => {
+                            const keyEntries = colorElementMap.get(key);
+                            if (keyEntries) entries.push(...keyEntries);
+                        });
                     }
                 }
+
+                if (entries && entries.length) {
+                    console.log(`PaletteLive: Found ${entries.length} elements after rebuild`);
+                }
             }
+
             if (entries && entries.length) {
                 entries.forEach(({ element, cssProp }) => {
                     try {
+                        if (cssProp === 'background-color' && _isImageContainer(element)) return;
                         captureInlineSnapshot(element, cssProp);
                         // !important war: strip existing inline !important before applying ours
                         if (element.style.getPropertyPriority(cssProp) === 'important') {
@@ -1005,10 +1199,14 @@
                         // Use the normalized hex value for consistency
                         element.style.setProperty(cssProp, currentHex, 'important');
 
-                        // Clear background-image to prevent gradients/images from masking the color
+                        // Only clear background-image if the original element had no background image
                         if (cssProp === 'background-color') {
-                            captureInlineSnapshot(element, 'background-image');
-                            element.style.setProperty('background-image', 'none', 'important');
+                            const origBgImg = window.getComputedStyle(element).backgroundImage;
+                            // Only clear gradients; skip 'none' (allows lazy-loaded images later) and url() (preserves images)
+                            if (origBgImg && origBgImg !== 'none' && !origBgImg.includes('url(')) {
+                                captureInlineSnapshot(element, 'background-image');
+                                element.style.setProperty('background-image', 'none', 'important');
+                            }
                         }
                         appliedCount++;
                     } catch (error) {
@@ -1026,19 +1224,29 @@
                     // Check if this element was already handled via the map above
                     const propMap = overrideMap.get(el);
                     const alreadyDone = propMap && propMap.has('background-color');
-                    if (!alreadyDone && (bgHex === originalHex || appliedCount === 0)) {
+
+                    // Allow if exact match OR fuzzy match
+                    const isMatch = bgHex === originalHex || window.ColorUtils.areSimilar(bgHex, originalHex, 10);
+
+                    if (!alreadyDone && (isMatch || appliedCount === 0)) {
+                        if (_isImageContainer(el)) return;
                         captureInlineSnapshot(el, 'background-color');
                         captureInlineSnapshot(el, 'background-image');
                         if (el.style.getPropertyPriority('background-color') === 'important') {
                             el.style.removeProperty('background-color');
                         }
                         el.style.setProperty('background-color', currentHex, 'important');
-                        el.style.setProperty('background-image', 'none', 'important');
+                        const elBgImg = window.getComputedStyle(el).backgroundImage;
+                        // Only clear gradients; skip 'none' (allows lazy-loaded images later) and url() (preserves images)
+                        if (elBgImg && elBgImg !== 'none' && !elBgImg.includes('url(')) {
+                            el.style.setProperty('background-image', 'none', 'important');
+                        }
 
                         // Add to colorElementMap for future reference
                         if (!colorElementMap.has(originalHex)) {
                             colorElementMap.set(originalHex, []);
                         }
+                        // Avoid duplicates
                         const alreadyInMap = colorElementMap.get(originalHex).some(e => e.element === el && e.cssProp === 'background-color');
                         if (!alreadyInMap) {
                             colorElementMap.get(originalHex).push({ element: el, cssProp: 'background-color' });
@@ -1053,25 +1261,10 @@
             // Ensure the watchdog is running when we have active overrides
             startOverrideWatchdog();
 
-            // Always apply fallback CSS as a safety net — even when inline overrides succeed.
-            // This ensures the override persists if the page later removes/overwrites inline styles.
-            // Note: applyRawOverrideFallback will modify DOM (classList), so it needs to be inside performDOMChange
-            // or performDOMChange needs to support nested calls (reentrancy).
-            // Current performDOMChange Implementation:
-            // window.__plIsApplyingOverrides = true; stop(); try { cb() } finally { window.__plIsApplyingOverrides = false; start(); }
-            //
-            // If I nest:
-            // Outer: flag=true, stop()
-            // Inner: flag=true, stop() (idempotent)
-            // Inner finally: flag=false, start() -> OBSERVER RESTARTED!
-            // Outer continues: ... modifies DOM ... -> OBSERVER TRIGGERS!
-            //
-            // So performDOMChange is NOT reentrant safe as implemented.
-            // I should NOT wrap inner functions if the outer one is wrapped.
-            //
-            // Fix: Modify performDOMChange to handle reentrancy via counter or check flag.
-
-            applyRawOverrideFallback(data);
+            // Update fallback CSS rules without walking the DOM.
+            // applyRawOverrideFallback does a full DOM walk per override — too expensive.
+            // Fallback classes were already applied during initial scan/bulk apply.
+            batchRefreshFallbackCSS();
 
             if (appliedCount > 0) {
                 console.log(`PaletteLive: Applied ${currentHex} to ${appliedCount} element-properties for ${originalHex}`);
@@ -1095,14 +1288,25 @@
             if (document.body && window.ShadowWalker && typeof window.ShadowWalker.walk === 'function') {
                 window.ShadowWalker.walk(document.body, (element) => {
                     try {
+                        // Skip invisible elements — no need to apply fallback classes
+                        if (element.offsetWidth === 0 && element.offsetHeight === 0) return;
+
                         const style = window.getComputedStyle(element);
+                        if (style.display === 'none' || style.visibility === 'hidden') return;
+
                         const hasClass = Object.values(classMap).some(className => element.classList.contains(className));
                         if (hasClass) return;
 
                         if (checkMatch(style.backgroundColor, data.original)) {
-                            element.classList.add(classMap.backgroundColor);
-                            addedFallbackClasses.add(classMap.backgroundColor);
-                            matchedCount++;
+                            if (!_isImageContainer(element)) {
+                                element.classList.add(classMap.backgroundColor);
+                                addedFallbackClasses.add(classMap.backgroundColor);
+                                const origBgImg = style.backgroundImage;
+                                if (origBgImg && origBgImg !== 'none' && !origBgImg.includes('url(')) {
+                                    element.style.setProperty('background-image', 'none', 'important');
+                                }
+                                matchedCount++;
+                            }
                         }
                         if (checkMatch(style.color, data.original)) {
                             element.classList.add(classMap.color);
@@ -1156,7 +1360,10 @@
             }
 
             const selectors = {};
-            selectors[`.${classMap.backgroundColor}`] = { 'background-color': currentHex, 'background-image': 'none' };
+            // Same guard as batchRefreshFallbackCSS — don't clear
+            // background-image in stylesheet rules; per-element inline
+            // guard handles it below during the walk.
+            selectors[`.${classMap.backgroundColor}`] = { 'background-color': currentHex };
             selectors[`.${classMap.color}`] = { color: currentHex };
             selectors[`.${classMap.borderTopColor}`] = { 'border-top-color': currentHex };
             selectors[`.${classMap.borderRightColor}`] = { 'border-right-color': currentHex };
@@ -1180,11 +1387,119 @@
     }
 
     // ════════════════════════════════════════════════
+    //  Proactive text-contrast helper (inline during override apply)
+    // ════════════════════════════════════════════════
+    /**
+     * When a background-color is changed on an element, immediately check all
+     * direct text children for contrast and fix any that fall below WCAG AA.
+     * This catches invisible text AT THE SOURCE rather than relying on the
+     * delayed reactive sweep.
+     */
+    function _fixChildTextContrast(parentEl, newBgHex) {
+        if (!_lastPaletteHexes || !_lastPaletteHexes.length) return;
+        const MIN_CR = 4.5;
+        const bwHexes = ['#ffffff', '#000000'];
+        const palette = _lastPaletteHexes.map(h => {
+            let hex = h.toLowerCase();
+            if (hex.length === 9 && hex.endsWith('ff')) hex = hex.substring(0, 7);
+            return hex;
+        });
+
+        const fixEl = (el) => {
+            try {
+                // Only fix elements with actual text content
+                let hasText = false;
+                for (let i = 0; i < el.childNodes.length; i++) {
+                    if (el.childNodes[i].nodeType === Node.TEXT_NODE && el.childNodes[i].textContent.trim()) {
+                        hasText = true; break;
+                    }
+                }
+                if (!hasText && !(el.textContent && el.textContent.trim())) return;
+
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden') return;
+                const textColor = style.color;
+                if (!textColor || window.ColorUtils.isTransparent(textColor)) return;
+
+                const textHex = window.ColorUtils.rgbToHex8(textColor).toLowerCase();
+                const currentCR = _contrastRatio(textHex, newBgHex);
+                if (currentCR >= MIN_CR) return; // already readable
+
+                // Find best replacement: palette color first, then black/white
+                let bestHex = null, bestCR = 0;
+                for (const c of palette) {
+                    const cr = _contrastRatio(c, newBgHex);
+                    if (cr >= MIN_CR && cr > bestCR) { bestCR = cr; bestHex = c; }
+                }
+                if (!bestHex) {
+                    for (const c of bwHexes) {
+                        const cr = _contrastRatio(c, newBgHex);
+                        if (cr > bestCR) { bestCR = cr; bestHex = c; }
+                    }
+                }
+                if (bestHex && bestCR > currentCR) {
+                    el.style.setProperty('color', bestHex, 'important');
+                    // Track this fix so reapplyAllOverrides / watchdog won't undo it
+                    _textContrastFixed.add(el);
+                }
+            } catch (e) { /* ignore */ }
+        };
+
+        // Fix the parent itself if it has text
+        fixEl(parentEl);
+        // Fix immediate children (1 level deep for performance)
+        try {
+            const children = Array.from(parentEl.children);
+            const limit = Math.min(children.length, 50); // cap for perf
+            for (let i = 0; i < limit; i++) fixEl(children[i]);
+        } catch (e) { /* ignore */ }
+    }
+
+    // ════════════════════════════════════════════════
     //  Bulk override — single DOM walk for many overrides
     // ════════════════════════════════════════════════
+    // Cooldown flag: after bulk apply, suppress observer/scroll/watchdog
+    // to prevent cascading DOM walks from causing lag.
+    let _plBulkApplyCooldown = false;
+    let _plBulkApplyCooldownTimer = null;
+
+    // Track elements whose text color was fixed by enforceTextContrast.
+    // reapplyAllOverrides & watchdog must respect these to avoid undoing fixes.
+    let _textContrastFixed = new WeakSet();
+    let _lastPaletteHexes = null;
+    let _textContrastRerunTimer = null;
+
+    // Shared deferred contrast timer — all processAddedSubtree calls funnel
+    // mutations into this single debounced 800ms pass instead of spawning one
+    // timer per added node.  Eliminates timer explosions on high-churn pages
+    // (Reddit virtual scroller, Pinterest masonry, etc.).
+    let _deferredContrastTimer = null;
+    function _scheduleDeferredContrast() {
+        clearTimeout(_deferredContrastTimer);
+        _deferredContrastTimer = setTimeout(() => {
+            if (_lastPaletteHexes && _lastPaletteHexes.length && rawOverrideState.size > 0) {
+                // Evict stale bg-cache entries before the sweep so background
+                // changes caused by class toggles are picked up correctly.
+                _bgCache = new WeakMap();
+                enforceTextContrast(_lastPaletteHexes);
+            }
+        }, 800);
+    }
+
+    function startBulkApplyCooldown(ms) {
+        _plBulkApplyCooldown = true;
+        clearTimeout(_plBulkApplyCooldownTimer);
+        _plBulkApplyCooldownTimer = setTimeout(() => {
+            _plBulkApplyCooldown = false;
+        }, ms || 2000);
+    }
+
     function applyBulkRawOverrides(overridesArray) {
         if (!overridesArray || !overridesArray.length) return 0;
         let totalApplied = 0;
+
+        // Suppress cascading reprocessing for 2s after bulk apply
+        startBulkApplyCooldown(2000);
 
         performDOMChange(() => {
             ensureColorMap();
@@ -1208,6 +1523,8 @@
             if (!overrideEntries.length) return;
 
             // ── Phase 2: Inline overrides from colorElementMap (no DOM walk needed) ──
+            // Track elements already handled so Phase 3 can skip them.
+            const handledElements = new WeakSet();
             let mapRebuilt = false;
             for (const entry of overrideEntries) {
                 let entries = colorElementMap.get(entry.originalHex);
@@ -1222,15 +1539,23 @@
                 if (entries && entries.length) {
                     entries.forEach(({ element, cssProp }) => {
                         try {
+                            if (cssProp === 'background-color' && _isImageContainer(element)) return;
                             captureInlineSnapshot(element, cssProp);
                             if (element.style.getPropertyPriority(cssProp) === 'important') {
                                 element.style.removeProperty(cssProp);
                             }
                             element.style.setProperty(cssProp, entry.currentHex, 'important');
                             if (cssProp === 'background-color') {
-                                captureInlineSnapshot(element, 'background-image');
-                                element.style.setProperty('background-image', 'none', 'important');
+                                const origBgImg = window.getComputedStyle(element).backgroundImage;
+                                // Only clear gradients; skip 'none' (allows lazy-loaded images later) and url() (preserves images)
+                                if (origBgImg && origBgImg !== 'none' && !origBgImg.includes('url(')) {
+                                    captureInlineSnapshot(element, 'background-image');
+                                    element.style.setProperty('background-image', 'none', 'important');
+                                }
+                                // Proactive contrast fix: immediately fix text children
+                                _fixChildTextContrast(element, entry.currentHex);
                             }
+                            handledElements.add(element);
                             totalApplied++;
                         } catch (e) { /* ignore */ }
                     });
@@ -1238,8 +1563,13 @@
                 rawOverrideState.set(entry.originalHex, entry.currentHex);
             }
 
-            // ── Phase 3: ONE fallback DOM walk for ALL overrides ──
-            // Build a reverse lookup: originalHex → { classMap, currentHex }
+            // ── Phase 3: Fallback — inject CSS classes + rules (NO full DOM walk) ──
+            // Instead of walking the entire DOM (expensive), we rely on CSS-class
+            // based fallback rules that apply via specificity.  The Phase 2 inline
+            // overrides already cover all elements in colorElementMap.  For elements
+            // NOT in the map (lazy-loaded, pseudo-elements, shadow DOM etc.), the
+            // fallback CSS classes were already added during previous scans/applies.
+            // A lightweight targeted walk only processes elements NOT already handled.
             const fallbackLookup = new Map();
             for (const entry of overrideEntries) {
                 fallbackLookup.set(entry.originalHex, entry);
@@ -1258,10 +1588,28 @@
                 { js: 'stroke', key: 'stroke' }
             ];
 
-            if (document.body && window.ShadowWalker && typeof window.ShadowWalker.walk === 'function') {
+            // Walk only if Phase 2 didn't handle many elements (< 80% of expected).
+            // This avoids the expensive full DOM walk on pages where the colorElementMap
+            // already covers all visible elements.
+            const expectedCoverage = overrideEntries.reduce((sum, e) => {
+                const ents = colorElementMap.get(e.originalHex);
+                return sum + (ents ? ents.length : 0);
+            }, 0);
+            const needsFallbackWalk = totalApplied < expectedCoverage * 0.5 || expectedCoverage === 0;
+
+            if (needsFallbackWalk && document.body && window.ShadowWalker && typeof window.ShadowWalker.walk === 'function') {
+                let _fbCount = 0;
+                const _FB_LIMIT = 3000; // cap fallback walk to prevent freezes
                 window.ShadowWalker.walk(document.body, (element) => {
+                    if (_fbCount >= _FB_LIMIT) return;
+                    if (handledElements.has(element)) return; // skip already-handled
                     try {
+                        // Skip invisible elements
+                        if (element.offsetWidth === 0 && element.offsetHeight === 0) return;
+
                         const style = window.getComputedStyle(element);
+                        if (style.display === 'none' || style.visibility === 'hidden') return;
+
                         for (const { js, key } of propChecks) {
                             const computed = style[js];
                             if (!computed || window.ColorUtils.isTransparent(computed)) continue;
@@ -1271,10 +1619,20 @@
                             if (!entry) continue;
                             const className = entry.classMap[key];
                             if (!element.classList.contains(className)) {
+                                // Skip bg-color on image containers
+                                if (key === 'backgroundColor' && _isImageContainer(element)) continue;
                                 element.classList.add(className);
                                 addedFallbackClasses.add(className);
+                                // Only clear gradients; skip 'none' (allows lazy-loaded images later) and url() (preserves images)
+                                if (key === 'backgroundColor') {
+                                    const origBgImg = style.backgroundImage;
+                                    if (origBgImg && origBgImg !== 'none' && !origBgImg.includes('url(')) {
+                                        element.style.setProperty('background-image', 'none', 'important');
+                                    }
+                                }
                             }
                         }
+                        _fbCount++;
                     } catch (e) { /* ignore */ }
                 });
             }
@@ -1284,7 +1642,8 @@
             for (const entry of overrideEntries) {
                 const c = entry.currentHex;
                 const cm = entry.classMap;
-                allSelectors[`.${cm.backgroundColor}`] = { 'background-color': c, 'background-image': 'none' };
+                // Don't set background-image:none in stylesheet rule — per-element inline guards handle it.
+                allSelectors[`.${cm.backgroundColor}`] = { 'background-color': c };
                 allSelectors[`.${cm.color}`] = { color: c };
                 allSelectors[`.${cm.borderTopColor}`] = { 'border-top-color': c };
                 allSelectors[`.${cm.borderRightColor}`] = { 'border-right-color': c };
@@ -1306,13 +1665,380 @@
         return totalApplied;
     }
 
+    // ════════════════════════════════════════════════
+    //  Post-Apply Text Contrast Enforcement
+    // ════════════════════════════════════════════════
+    // After palette application, walk every text-bearing element and check its
+    // computed `color` against its effective background.  If contrast falls below
+    // WCAG AA (4.5:1) we dynamically override the text color to the best palette
+    // color that restores readability (or plain white/black as fallback).
+
+    /** WCAG relative luminance for an {r,g,b} object (0..255) → 0..1 */
+    function _relLum(rgb) {
+        const s = [rgb.r, rgb.g, rgb.b].map(c => {
+            c = c / 255;
+            return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+        });
+        return 0.2126 * s[0] + 0.7152 * s[1] + 0.0722 * s[2];
+    }
+
+    // ── Contrast-ratio LUT cache ──────────────────────────────────
+    // Memoize relative-luminance and contrast-ratio computations so that
+    // the thousands of identical calls during a DOM walk become O(1) lookups.
+    const _lumCache = new Map();   // hex → luminance (0..1)
+    const _crCache = new Map();   // "hex1|hex2" → ratio (1..21)
+
+    // Per-element effective-background cache — avoids re-walking ancestor
+    // chains on repeated enforceTextContrast passes within the same palette
+    // session.  WeakMap has no .clear(), so we re-assign to evict entries.
+    // Flushed on palette apply/reset and before each scheduled sweep.
+    let _bgCache = new WeakMap();
+
+    /** Cached luminance for a hex string */
+    function _cachedLum(hex) {
+        let v = _lumCache.get(hex);
+        if (v !== undefined) return v;
+        const rgb = window.ColorUtils.hexToRgb(hex);
+        v = rgb ? _relLum(rgb) : 0;
+        _lumCache.set(hex, v);
+        return v;
+    }
+
+    /** Contrast ratio between two hex strings (1..21) — cached */
+    function _contrastRatio(hex1, hex2) {
+        const key = hex1 < hex2 ? hex1 + '|' + hex2 : hex2 + '|' + hex1;
+        let v = _crCache.get(key);
+        if (v !== undefined) return v;
+        const l1 = _cachedLum(hex1);
+        const l2 = _cachedLum(hex2);
+        const lighter = Math.max(l1, l2);
+        const darker = Math.min(l1, l2);
+        v = (lighter + 0.05) / (darker + 0.05);
+        _crCache.set(key, v);
+        return v;
+    }
+
+    /** Flush the LUT caches (call after palette changes) */
+    function _flushContrastCache() {
+        _lumCache.clear();
+        _crCache.clear();
+        _bgCache = new WeakMap(); // WeakMap has no .clear() — reassign to evict all entries
+    }
+
+    // ── Alpha-compositing helper ──────────────────────────────────
+    /**
+     * Composite a foreground RGBA over a background RGB.
+     * Returns { r, g, b } (all 0..255, opaque result).
+     */
+    function _alphaComposite(fgRgba, bgRgb) {
+        const a = fgRgba.a;
+        return {
+            r: Math.round(fgRgba.r * a + bgRgb.r * (1 - a)),
+            g: Math.round(fgRgba.g * a + bgRgb.g * (1 - a)),
+            b: Math.round(fgRgba.b * a + bgRgb.b * (1 - a))
+        };
+    }
+
+    /**
+     * Resolve the effective background color of an element by walking up the
+     * ancestor chain.  Semi-transparent layers are alpha-composited onto whatever
+     * lies behind them so the result accurately reflects the visual background.
+     * Returns a 6-digit hex string or '#ffffff' as ultimate fallback.
+     */
+    function _getEffectiveBg(el) {
+        // Fast path: return cached result from this palette session
+        const _cached = _bgCache.get(el);
+        if (_cached !== undefined) return _cached;
+
+        // Collect layers bottom-up (element → root)
+        const layers = []; // { r, g, b, a } from element upward
+        let current = el;
+        // MAX_DEPTH 20: modern SPAs/React pages can have 10+ nesting levels
+        // between a text node and the section that sets the background color.
+        // A depth of 5 was too shallow — causing the fallback #ffffff to be
+        // used instead of the real dark background, which made enforceTextContrast
+        // think text was fine when it wasn't.
+        const MAX_DEPTH = 20;
+        let depth = 0;
+        let hitOpaque = false;
+
+        while (current && depth < MAX_DEPTH) {
+            try {
+                const bg = window.getComputedStyle(current).backgroundColor;
+                if (bg && bg !== 'transparent' && bg !== 'rgba(0, 0, 0, 0)') {
+                    const rgba = window.ColorUtils.hexToRgb(
+                        window.ColorUtils.rgbToHex8(bg)
+                    );
+                    if (rgba && rgba.a > 0) {
+                        layers.push(rgba);
+                        if (rgba.a >= 1) { hitOpaque = true; break; }
+                    }
+                }
+            } catch (e) { /* ignore */ }
+            current = current.parentElement;
+            depth++;
+        }
+
+        // Final fallback: if we exhausted MAX_DEPTH without hitting an opaque layer,
+        // explicitly check body and documentElement before giving up on #ffffff.
+        if (!hitOpaque && current) {
+            for (const root of [current, document.body, document.documentElement]) {
+                if (!root) continue;
+                try {
+                    const bg = window.getComputedStyle(root).backgroundColor;
+                    if (bg && bg !== 'transparent' && bg !== 'rgba(0, 0, 0, 0)') {
+                        const rgba = window.ColorUtils.hexToRgb(window.ColorUtils.rgbToHex8(bg));
+                        if (rgba && rgba.a > 0) {
+                            layers.push(rgba);
+                            if (rgba.a >= 1) { hitOpaque = true; break; }
+                        }
+                    }
+                } catch (e) { /* ignore */ }
+            }
+        }
+
+        if (!layers.length) {
+            _bgCache.set(el, '#ffffff');
+            return '#ffffff';
+        }
+
+        // Composite from back (deepest solid) to front (element itself)
+        // Start with page-default white if we never hit an opaque layer
+        let composite = hitOpaque
+            ? { r: layers[layers.length - 1].r, g: layers[layers.length - 1].g, b: layers[layers.length - 1].b }
+            : { r: 255, g: 255, b: 255 };
+
+        // Walk from the layer just above the opaque base toward the element
+        const startIdx = hitOpaque ? layers.length - 2 : layers.length - 1;
+        for (let i = startIdx; i >= 0; i--) {
+            composite = _alphaComposite(layers[i], composite);
+        }
+
+        // Convert to hex, cache and return
+        const toHex2 = n => Math.min(255, Math.max(0, n)).toString(16).padStart(2, '0');
+        const _bgResult = '#' + toHex2(composite.r) + toHex2(composite.g) + toHex2(composite.b);
+        _bgCache.set(el, _bgResult);
+        return _bgResult;
+    }
+
+    /**
+     * Walk every text-bearing element and ensure its rendered text color has
+     * sufficient contrast (≥ MIN_CR) against its effective background.
+     *
+     * @param {string[]} paletteHexes — imported palette colors to choose from
+     */
+    function enforceTextContrast(paletteHexes, subtreeRoot) {
+        if (!document.body) return 0;
+        const MIN_CR = 4.5; // WCAG AA normal text
+        const MIN_CR_LARGE = 3.0; // WCAG AA large text (≥18px bold or ≥24px)
+
+        // Build candidate pool: palette colors + pure white & black
+        const bwHexes = ['#ffffff', '#000000'];
+        const paletteSet = new Set();
+        if (paletteHexes && paletteHexes.length) {
+            paletteHexes.forEach(h => {
+                let hex = h.toLowerCase();
+                if (hex.length === 9 && hex.endsWith('ff')) hex = hex.substring(0, 7);
+                paletteSet.add(hex);
+            });
+        }
+        // Remove b/w duplicates from palette set so we can distinguish them
+        bwHexes.forEach(h => paletteSet.delete(h));
+        const paletteCandidates = [...paletteSet]; // user's palette colors only
+        const allCandidates = [...paletteCandidates, ...bwHexes]; // palette first, b/w last
+
+        let fixedCount = 0;
+
+        /** Check if element or its immediate children contain visible text */
+        function hasVisibleText(el) {
+            for (let i = 0; i < el.childNodes.length; i++) {
+                const node = el.childNodes[i];
+                if (node.nodeType === Node.TEXT_NODE && node.textContent.trim()) return true;
+            }
+            return false;
+        }
+
+        // ── Expanded text-element detection ────────────────────────
+        const TEXT_TAGS = /^(H[1-6]|P|SPAN|A|LI|LABEL|TD|TH|CAPTION|FIGCAPTION|BLOCKQUOTE|CITE|Q|ABBR|EM|STRONG|B|I|U|S|SMALL|SUB|SUP|MARK|CODE|PRE|SUMMARY|DT|DD|BUTTON|LEGEND|INPUT|TEXTAREA|SELECT|OPTION|OUTPUT|METER|PROGRESS|TIME|DATA|VAR|SAMP|KBD|ADDRESS|DIV|SECTION|ARTICLE|MAIN|ASIDE|HEADER|FOOTER|NAV)$/;
+        const TEXT_ROLES = /^(heading|button|link|menuitem|option|tab|treeitem|cell|gridcell|columnheader|rowheader|tooltip|status|alert|log|marquee|timer|note)$/;
+
+        /** Check if element is likely a text-display element */
+        function isTextElement(el) {
+            const tag = el.tagName;
+            if (!tag) return false;
+            // Standard text tags (expanded to include form & semantic elements)
+            if (TEXT_TAGS.test(tag.toUpperCase())) return true;
+            // SVG text
+            if (tag.toLowerCase() === 'text' && el.namespaceURI === 'http://www.w3.org/2000/svg') return true;
+            // ARIA roles that imply text content
+            const role = el.getAttribute && el.getAttribute('role');
+            if (role && TEXT_ROLES.test(role.toLowerCase())) return true;
+            // Contenteditable elements
+            if (el.isContentEditable) return true;
+            return false;
+        }
+
+        /** Determine if text is "large" for WCAG (>=18px bold or >=24px) */
+        function isLargeText(style) {
+            const size = parseFloat(style.fontSize) || 16;
+            const weight = parseInt(style.fontWeight) || (style.fontWeight === 'bold' ? 700 : 400);
+            return size >= 24 || (size >= 18.66 && weight >= 700);
+        }
+
+        /**
+         * Aesthetic-aware candidate selection.
+         * Priority: palette colors that pass AA > b/w that pass AA > highest-CR fallback.
+         * Among passing palette colors, prefer the one closest in luminance to the
+         * original text color (preserves the palette's visual character).
+         */
+        function pickBestCandidate(bgHex, origTextHex, threshold) {
+            const origLum = _cachedLum(origTextHex);
+            let bestPalette = null, bestPaletteCR = 0, bestPaletteLumDist = Infinity;
+            let bestBW = null, bestBWCR = 0;
+            let fallbackHex = null, fallbackCR = 0;
+
+            for (const c of paletteCandidates) {
+                const cr = _contrastRatio(c, bgHex);
+                if (cr >= threshold) {
+                    const dist = Math.abs(_cachedLum(c) - origLum);
+                    // Prefer palette candidate with passing CR closest to original luminance
+                    if (!bestPalette || dist < bestPaletteLumDist ||
+                        (dist === bestPaletteLumDist && cr > bestPaletteCR)) {
+                        bestPalette = c;
+                        bestPaletteCR = cr;
+                        bestPaletteLumDist = dist;
+                    }
+                }
+                if (cr > fallbackCR) { fallbackCR = cr; fallbackHex = c; }
+            }
+
+            for (const c of bwHexes) {
+                const cr = _contrastRatio(c, bgHex);
+                if (cr >= threshold && cr > bestBWCR) {
+                    bestBWCR = cr;
+                    bestBW = c;
+                }
+                if (cr > fallbackCR) { fallbackCR = cr; fallbackHex = c; }
+            }
+
+            // Prefer palette color over b/w when both pass
+            if (bestPalette) return { hex: bestPalette, cr: bestPaletteCR };
+            if (bestBW) return { hex: bestBW, cr: bestBWCR };
+            // Nothing passes — return highest-contrast regardless
+            return fallbackHex ? { hex: fallbackHex, cr: fallbackCR } : null;
+        }
+
+        const processElement = (el) => {
+            try {
+                const directText = hasVisibleText(el);
+                const isTextTag = isTextElement(el);
+
+                if (!directText && !isTextTag) return;
+
+                // For text tags without direct text, check if they contain text at all
+                if (!directText && isTextTag) {
+                    if (!el.textContent || !el.textContent.trim()) return;
+                }
+
+                const style = window.getComputedStyle(el);
+
+                // Skip hidden elements
+                if (style.display === 'none' || style.visibility === 'hidden' ||
+                    parseFloat(style.opacity) < 0.1) return;
+                // Skip zero-size elements (collapsed, overflow:hidden wrappers)
+                if (el.offsetWidth === 0 && el.offsetHeight === 0) return;
+
+                const textColor = style.color;
+                if (!textColor || window.ColorUtils.isTransparent(textColor)) return;
+
+                const textHex = window.ColorUtils.rgbToHex8(textColor).toLowerCase();
+                const bgHex = _getEffectiveBg(el);
+                const currentCR = _contrastRatio(textHex, bgHex);
+
+                // Use relaxed threshold for large text
+                const threshold = isLargeText(style) ? MIN_CR_LARGE : MIN_CR;
+
+                if (currentCR >= threshold) return; // already fine
+
+                const best = pickBestCandidate(bgHex, textHex, threshold);
+                if (best && best.cr > currentCR) {
+                    el.style.setProperty('color', best.hex, 'important');
+                    _textContrastFixed.add(el);
+                    fixedCount++;
+                }
+            } catch (e) { /* ignore */ }
+        };
+
+        // ── Subtree path: small bounded scope, always synchronous ──────────
+        if (subtreeRoot) {
+            performDOMChange(() => {
+                processElement(subtreeRoot);
+                if (window.ShadowWalker && typeof window.ShadowWalker.walk === 'function') {
+                    window.ShadowWalker.walk(subtreeRoot, processElement);
+                }
+            });
+            if (fixedCount > 0) {
+                console.log(`PaletteLive: Text contrast enforced on ${fixedCount} elements (subtree)`);
+            }
+            return fixedCount;
+        }
+
+        // ── Full-DOM path: chunked async to prevent main-thread freeze ───────
+        // Use querySelectorAll instead of ShadowWalker.walk — Chrome's native
+        // selector engine collects only matching nodes and is ~50× faster than
+        // a JS callback visiting every element.  Results are then processed in
+        // CHUNK_SIZE batches separated by setTimeout(0) so the browser can
+        // handle input/rendering between chunks and the page never freezes.
+        const _tagSel =
+            'h1,h2,h3,h4,h5,h6,p,span,a,li,label,td,th,caption,' +
+            'figcaption,blockquote,cite,q,abbr,em,strong,b,i,u,s,small,sub,sup,' +
+            'mark,code,pre,summary,dt,dd,button,legend,input,textarea,select,option,' +
+            'time,address,var,samp,kbd,' +
+            'div,section,article,main,aside,header,footer,nav,' +
+            '[role="heading"],[role="button"],[role="link"],[role="menuitem"],' +
+            '[contenteditable="true"]';
+        const _candidates = [];
+        try {
+            document.querySelectorAll(_tagSel).forEach(el => _candidates.push(el));
+        } catch (e) { /* ignore */ }
+        [document.documentElement, document.body].forEach(root => {
+            if (root) _candidates.unshift(root);
+        });
+
+        // Hard cap: elements beyond MAX_ELEMENTS are likely off-screen on
+        // high-churn pages (Reddit, Twitter). They will be caught by the next
+        // scroll/mutation-triggered pass once they scroll into view.
+        const _MAX_EL = 3000;
+        if (_candidates.length > _MAX_EL) _candidates.length = _MAX_EL;
+
+        const _CHUNK = 60;
+        let _ci = 0;
+        const _runChunk = () => {
+            performDOMChange(() => {
+                const end = Math.min(_ci + _CHUNK, _candidates.length);
+                while (_ci < end) processElement(_candidates[_ci++]);
+            });
+            if (_ci < _candidates.length) {
+                setTimeout(_runChunk, 0);
+            } else if (fixedCount > 0) {
+                console.log(`PaletteLive: Text contrast enforced on ${fixedCount} elements`);
+            }
+        };
+        _runChunk();
+        return 0; // async — count is not available synchronously
+    }
+
     function checkMatch(computed, target) {
         if (!computed || !target) return false;
         if (window.ColorUtils.isTransparent(computed)) return false;
 
         const computedHex = window.ColorUtils.rgbToHex8(computed).toLowerCase();
         const targetHex = window.ColorUtils.rgbToHex8(target).toLowerCase();
-        return computedHex === targetHex;
+
+        if (computedHex === targetHex) return true;
+
+        // Use fuzzy matching for fallbacks
+        return window.ColorUtils.areSimilar(computedHex, targetHex, 10);
     }
 
     function toRgba(hex, alpha) {
@@ -1627,12 +2353,37 @@
         if (savedData.settings && savedData.settings.vision) {
             setVisionMode(savedData.settings.vision);
         }
+
+        // Re-run text contrast enforcement with the saved palette hexes
+        const paletteHexes = Array.isArray(savedData.appliedPaletteHexes)
+            ? savedData.appliedPaletteHexes
+            : null;
+        if (paletteHexes && paletteHexes.length) {
+            _lastPaletteHexes = paletteHexes;
+            _textContrastFixed = new WeakSet();
+            _flushContrastCache();
+            // Three passes — same strategy as APPLY_OVERRIDE_BULK
+            setTimeout(() => {
+                enforceTextContrast(paletteHexes);
+                setTimeout(() => {
+                    enforceTextContrast(paletteHexes);
+                }, 300);
+            }, 150);
+            const idleCb = typeof requestIdleCallback === 'function'
+                ? requestIdleCallback
+                : (fn) => setTimeout(fn, 1000);
+            idleCb(() => {
+                if (_lastPaletteHexes === paletteHexes) {
+                    enforceTextContrast(paletteHexes);
+                }
+            }, { timeout: 2000 });
+        }
     }
 
     // Observer rate-limiting state
     let observerRescanCount = 0;
     let observerRescanWindow = Date.now();
-    const OBSERVER_MAX_RESCANS_PER_MINUTE = 60;
+    const OBSERVER_MAX_RESCANS_PER_MINUTE = 30;
     let observerPaused = false;
 
     function processAddedSubtree(node) {
@@ -1654,6 +2405,12 @@
         ];
 
         const processElement = (element) => {
+            // When a media element enters the DOM (lazy-loaded image/video),
+            // remove bg-color overrides from its ancestor containers so it's visible.
+            if (_MEDIA_TAGS.has(element.tagName) && rawOverrideState.size > 0) {
+                _undoBgOverridesForMedia(element);
+            }
+
             try {
                 const style = window.getComputedStyle(element);
                 props.forEach(({ js, css }) => {
@@ -1671,7 +2428,24 @@
 
                     // Auto-apply existing overrides to new elements
                     if (rawOverrideState.has(hex)) {
+                        // Skip bg-color on image containers
+                        if (css === 'background-color' && _isImageContainer(element)) return;
+                        // Never re-apply a color override on an element whose text
+                        // was already fixed by enforceTextContrast — would undo the
+                        // fix and make text invisible again.
+                        if (css === 'color' && _textContrastFixed.has(element)) return;
                         const current = rawOverrideState.get(hex);
+                        // Pre-visibility check: if applying this text-color override
+                        // would produce unreadable text (CR < 4.5 against the
+                        // effective background), skip the override entirely.  The
+                        // post-subtree enforceTextContrast call will assign
+                        // the best readable colour instead.
+                        if (css === 'color') {
+                            try {
+                                const effBg = _getEffectiveBg(element);
+                                if (_contrastRatio(current, effBg) < 4.5) return;
+                            } catch (e) { /* ignore — proceed with override */ }
+                        }
                         try {
                             captureInlineSnapshot(element, css);
                             if (element.style.getPropertyPriority(css) === 'important') {
@@ -1704,6 +2478,21 @@
         }
         // Also process the node itself if it's an element
         processElement(node);
+
+        // Enforce text contrast immediately on the newly processed subtree.
+        // We call per-subtree (not global) so it's fast even on React pages
+        // where dozens of nodes are added per second. A debounced global pass
+        // would keep getting pushed back and never fire during initial render.
+        if (_lastPaletteHexes && _lastPaletteHexes.length && rawOverrideState.size > 0) {
+            enforceTextContrast(_lastPaletteHexes, node);
+            // Deferred single debounced full-document pass: newly injected elements
+            // may not have been laid out yet when the immediate call above runs, so
+            // they get skipped by the offsetWidth/offsetHeight guard.  Instead of
+            // spawning one timer per node (causes timer explosions on Reddit, Pinterest)
+            // we funnel ALL pending additions into ONE shared debounced 400ms sweep.
+            // By 400ms the browser has completed layout for all injected nodes.
+            _scheduleDeferredContrast();
+        }
     }
 
     // ── Mutation Observer ─────────────────────────────────────────
@@ -1772,32 +2561,59 @@
                 });
 
                 if (addedNodes.length > 0 && addedNodes.length <= 50) {
-                    // Small batch: process incrementally
+                    // Small batch: process incrementally (200ms debounce)
                     clearTimeout(rebuildTimer);
                     rebuildTimer = setTimeout(() => {
-                        if (isRescanning) return; // defer to active rescan
-                        // console.log(`PaletteLive: Incrementally scanning ${addedNodes.length} new nodes`);
+                        if (isRescanning) return;
+                        if (_plBulkApplyCooldown) {
+                            // During the post-apply cooldown we must NOT re-run
+                            // processAddedSubtree (it would create override feedback
+                            // loops), but we MUST still enforce text contrast on
+                            // any freshly added elements (e.g. React re-renders
+                            // happening while the cooldown is active).  Contrast
+                            // enforcement only sets 'color' — never unsafe overrides.
+                            if (_lastPaletteHexes && _lastPaletteHexes.length) {
+                                addedNodes.forEach(node => enforceTextContrast(_lastPaletteHexes, node));
+                            }
+                            return;
+                        }
                         addedNodes.forEach(node => processAddedSubtree(node));
-                    }, 100);
+                    }, 200);
                 } else if (addedNodes.length > 50) {
-                    // Large batch: full rebuild (includes reapplyAllOverrides)
+                    // Large batch: full rebuild (400ms debounce, includes reapplyAllOverrides)
                     clearTimeout(rebuildTimer);
                     rebuildTimer = setTimeout(() => {
-                        if (isRescanning) return; // defer to active rescan
+                        if (isRescanning) return;
+                        if (_plBulkApplyCooldown) {
+                            // Same cooldown policy: skip the expensive rebuild but
+                            // still enforce contrast on the full document.
+                            if (_lastPaletteHexes && _lastPaletteHexes.length) {
+                                enforceTextContrast(_lastPaletteHexes);
+                            }
+                            return;
+                        }
                         console.log('PaletteLive: DOM changed significantly, full rebuild');
                         buildColorMap();
-                    }, 200);
+                    }, 400);
                 }
             }
 
             if (hasAttributeChanges && !hasStructureChanges) {
-                // Attribute-only changes (class/style toggling) — debounced rebuild + reapply
+                // Attribute-only changes (class/style toggling) — debounced rebuild + reapply (500ms)
                 clearTimeout(rebuildTimer);
                 rebuildTimer = setTimeout(() => {
-                    if (isRescanning) return; // defer to active rescan
-                    // console.log('PaletteLive: Attribute changes detected, rebuilding color map');
+                    if (isRescanning) return;
+                    if (_plBulkApplyCooldown) {
+                        // Attribute changes can flip background colours (class
+                        // toggles on frameworks) — re-check contrast even during
+                        // cooldown so text doesn't go invisible.
+                        if (_lastPaletteHexes && _lastPaletteHexes.length) {
+                            enforceTextContrast(_lastPaletteHexes);
+                        }
+                        return;
+                    }
                     buildColorMap();
-                }, 300);
+                }, 500);
             }
         });
     }
@@ -1854,34 +2670,42 @@
     window.addEventListener('scroll', () => {
         if (__plPaused) return;
         if (isRescanning) return; // never compete with an in-flight rescan
+        if (_plBulkApplyCooldown) return; // suppress during post-apply cooldown
         if (rawOverrideState.size === 0) return; // nothing to re-apply
 
         clearTimeout(_plScrollReapplyTimer);
         _plScrollReapplyTimer = setTimeout(() => {
             if (isRescanning) return; // double-check after debounce
             const now = Date.now();
-            // Throttle to at most once per 800ms
-            if (now - _plLastScrollReapply < 800) return;
+            // Throttle to at most once per 1500ms
+            if (now - _plLastScrollReapply < 1500) return;
             _plLastScrollReapply = now;
-            // Rebuild map to capture lazy-loaded elements (buildColorMap calls reapplyAllOverrides)
-            buildColorMap();
-        }, 250);
+            // Lightweight re-apply — only touches elements already in the map.
+            // Avoids the expensive full DOM walk that buildColorMap() does.
+            reapplyAllOverrides();
+        }, 500);
     }, { passive: true });
 
     // ── Periodic Override Watchdog ─────────────────────────────────
     // Detects when the page silently reverts overrides (React reconciliation,
     // CSS animations, framework re-renders) and forces re-application.
     let _plWatchdogTimer = null;
+    let _plWatchdogNoDriftCount = 0; // adaptive: count consecutive no-drift ticks
+    const _WATCHDOG_FAST_MS = 5000;  // default interval
+    const _WATCHDOG_SLOW_MS = 10000; // slow interval after 3 consecutive no-drift ticks
 
     function startOverrideWatchdog() {
         if (_plWatchdogTimer) return;
-        _plWatchdogTimer = setInterval(() => {
+        _plWatchdogNoDriftCount = 0;
+
+        const _runWatchdogTick = () => {
             if (__plPaused) return;
             if (isRescanning) return; // never compete with an in-flight rescan
+            if (_plBulkApplyCooldown) return; // suppress during post-apply cooldown
             if (rawOverrideState.size === 0) return;
 
             let drifted = 0;
-            const sampleLimit = 200; // limit checks per tick to avoid perf issues
+            const sampleLimit = 100; // reduced from 200 to lower per-tick cost
             let checked = 0;
 
             rawOverrideState.forEach((currentHex, originalHex) => {
@@ -1892,6 +2716,11 @@
                 for (const { element, cssProp } of entries) {
                     if (checked >= sampleLimit) break;
                     if (!element.isConnected) continue;
+                    // Skip text color on elements fixed by enforceTextContrast
+                    if (cssProp === 'color' && _textContrastFixed.has(element)) {
+                        checked++;
+                        continue;
+                    }
                     try {
                         const jsName = cssPropToJs(cssProp);
                         const computed = window.getComputedStyle(element)[jsName];
@@ -1906,15 +2735,24 @@
             });
 
             if (drifted > 0) {
+                _plWatchdogNoDriftCount = 0;
                 console.log(`PaletteLive Watchdog: ${drifted}/${checked} overrides drifted, re-applying...`);
                 reapplyAllOverrides();
+            } else {
+                _plWatchdogNoDriftCount++;
             }
-        }, 2000); // Check every 2 seconds
+
+            // Adaptive interval: slow down after 3 consecutive no-drift ticks
+            const nextMs = _plWatchdogNoDriftCount >= 3 ? _WATCHDOG_SLOW_MS : _WATCHDOG_FAST_MS;
+            _plWatchdogTimer = setTimeout(_runWatchdogTick, nextMs);
+        };
+
+        _plWatchdogTimer = setTimeout(_runWatchdogTick, _WATCHDOG_FAST_MS);
     }
 
     function stopOverrideWatchdog() {
         if (_plWatchdogTimer) {
-            clearInterval(_plWatchdogTimer);
+            clearTimeout(_plWatchdogTimer);
             _plWatchdogTimer = null;
         }
     }

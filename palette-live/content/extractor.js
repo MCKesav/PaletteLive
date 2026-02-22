@@ -4,7 +4,7 @@
  */
 
 // Guard against re-injection - use version to allow updates
-const _EXTRACTOR_VERSION = 5;
+const _EXTRACTOR_VERSION = 6;
 if (window._extractorVersion === _EXTRACTOR_VERSION) {
   // Already loaded with same version
 } else {
@@ -196,22 +196,21 @@ const Extractor = {
             columnRuleColor: 'border'
         };
 
-        const BATCH_SIZE = 400;
+        const BATCH_SIZE = 150;
 
         for (let i = 0; i < elements.length; i += BATCH_SIZE) {
             const batch = elements.slice(i, i + BATCH_SIZE);
 
-            if (i > 0) {
-                // Use requestIdleCallback when available for better scheduling,
-                // fall back to setTimeout for environments without it
-                await new Promise(resolve => {
-                    if (typeof requestIdleCallback === 'function') {
-                        requestIdleCallback(resolve, { timeout: 100 });
-                    } else {
-                        setTimeout(resolve, 0);
-                    }
-                });
-            }
+            // Always yield before every batch so the browser can process events
+            // between chunks. Skipping the yield for i===0 was enough to freeze
+            // the page on sites with large DOMs (e.g. GitHub).
+            await new Promise(resolve => {
+                if (typeof requestIdleCallback === 'function') {
+                    requestIdleCallback(resolve, { timeout: 100 });
+                } else {
+                    setTimeout(resolve, 0);
+                }
+            });
 
             for (const el of batch) {
                 try {
@@ -231,6 +230,8 @@ const Extractor = {
 
                     // Background color — weighted by element area so large backgrounds
                     // (heroes, sections) carry more classification weight than tiny elements.
+                    // NOTE: transparent backgrounds are correctly skipped by _addComputedColor;
+                    // parent backgrounds will be counted when the parent element is visited.
                     const bgWeight = (isHidden ? 0.15 : Extractor._getAreaWeight(el));
                     Extractor._addComputedColor(style.backgroundColor, colorMap, 'background', null, bgWeight);
 

@@ -4,7 +4,7 @@
  */
 
 // Guard against re-injection - use version to allow updates
-const _SHADOW_WALKER_VERSION = 2;
+const _SHADOW_WALKER_VERSION = 3;
 if (window._shadowWalkerVersion === _SHADOW_WALKER_VERSION) {
     // Already loaded with same version
 } else {
@@ -47,16 +47,12 @@ if (window._shadowWalkerVersion === _SHADOW_WALKER_VERSION) {
                 // Detect closed Shadow DOMs (element has shadow host behavior but no accessible shadowRoot)
                 // Elements with closed shadow roots have no .shadowRoot property, but the browser
                 // may render content inside them that we can't access.
+                // NOTE: getBoundingClientRect() is intentionally avoided here because calling it
+                // for every empty element forces a synchronous layout reflow, which can freeze
+                // the page on large DOMs. We use a simple structural heuristic instead.
                 if (!node.shadowRoot && node.attachShadow && node.innerHTML === '' &&
                     node.childElementCount === 0 && node.children.length === 0) {
-                    // Heuristic: Element is empty in DOM but might have closed shadow content
-                    // Check if it has visible dimensions (indicating rendered content we can't see)
-                    try {
-                        const rect = node.getBoundingClientRect();
-                        if (rect.width > 0 && rect.height > 0) {
-                            ShadowWalker.closedShadowCount++;
-                        }
-                    } catch (e) { /* ignore */ }
+                    ShadowWalker.closedShadowCount++;
                 }
 
                 node = walker.nextNode();
