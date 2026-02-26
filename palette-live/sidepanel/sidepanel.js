@@ -18,14 +18,15 @@ document.addEventListener('DOMContentLoaded', () => {
         aaNormal: document.getElementById('wcag-aa-normal'),
         aaaNormal: document.getElementById('wcag-aaa-normal'),
         aaLarge: document.getElementById('wcag-aa-large'),
-        aaaLarge: document.getElementById('wcag-aaa-large')
+        aaaLarge: document.getElementById('wcag-aaa-large'),
     };
 
     // --- State ---
     let selectedSources = [];
-    let selectedSource = null;
+    let _selectedSource = null; // kept for future single-source API; active code uses selectedSources
     let selectedColor = null;
-    let editStartValue = null;
+    let _editStartValue = null;
+    let currentTabId = null;
     const editStartValues = new Map();
 
     // --- Utility functions ---
@@ -67,10 +68,7 @@ document.addEventListener('DOMContentLoaded', () => {
             if (!contrastEl || !ratingEl) return;
 
             // Determine background to check against
-            let bgHex = '#ffffff';
-            if (category === 'text' || category === 'border') {
-                bgHex = '#ffffff';
-            }
+            const bgHex = '#ffffff';
 
             // Use contrast utility if available
             let ratio = 1;
@@ -82,7 +80,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     const r = parseInt(h.slice(1, 3), 16) / 255;
                     const g = parseInt(h.slice(3, 5), 16) / 255;
                     const b = parseInt(h.slice(5, 7), 16) / 255;
-                    const toLinear = (c) => c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+                    const toLinear = (c) => (c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4));
                     return 0.2126 * toLinear(r) + 0.7152 * toLinear(g) + 0.0722 * toLinear(b);
                 };
                 const l1 = hexToRgb(hex);
@@ -112,7 +110,7 @@ document.addEventListener('DOMContentLoaded', () => {
             ratingEl.style.color = '#ffffff';
 
             if (contextEl) {
-                contextEl.textContent = `Against worst of black/white (${bgHex})`;
+                contextEl.textContent = `Against white (${bgHex})`;
             }
 
             setWcagRow(wcagRows.aaNormal, 'AA normal', ratio >= 4.5);
@@ -140,9 +138,12 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
         variableInfo.classList.remove('hidden');
-        variableInfo.innerHTML = data
-            .map(line => line.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'))
-            .join('<br>');
+        // Use DOM API instead of innerHTML to prevent XSS
+        variableInfo.textContent = '';
+        data.forEach((line, i) => {
+            if (i > 0) variableInfo.appendChild(document.createElement('br'));
+            variableInfo.appendChild(document.createTextNode(line));
+        });
     }
 
     function showEditor(payload) {
@@ -151,19 +152,22 @@ document.addEventListener('DOMContentLoaded', () => {
 
         selectedColor = payload.color || null;
         selectedSources = payload.sources || [];
-        selectedSource = selectedSources[0] || null;
+        _selectedSource = selectedSources[0] || null;
+        currentTabId = payload.tabId || null;
 
         const hex = sanitizePickerHex(payload.currentHex || (selectedColor && selectedColor.value) || '#000000');
 
         colorPicker.value = hex;
         updateSelectedLabel(hex);
-        editStartValue = normalizeHex(hex);
+        _editStartValue = normalizeHex(hex);
         editStartValues.clear();
-        selectedSources.forEach(source => {
-            editStartValues.set(source, payload.effectiveValues?.[source] || source);
+        selectedSources.forEach((source) => {
+            editStartValues.set(source, payload.effectiveValues?.[source] ?? source);
         });
 
-        exportSelectToggle.checked = !!payload.exportChecked;
+        // Default to checked — colors are included in export unless explicitly excluded.
+        exportSelectToggle.checked = payload.exportChecked !== false;
+        if (batchApplyBtn) batchApplyBtn.disabled = false;
         updateVariableInfoUI(payload.variableLines || []);
         updateContrast(hex, selectedColor ? selectedColor.primaryCategory : null);
     }
@@ -186,14 +190,19 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // --- Color picker change → tell popup to apply override ---
     const throttledNotifyPopup = rafThrottle((newValue) => {
-        chrome.runtime.sendMessage({
-            type: 'SIDEPANEL_COLOR_CHANGED',
-            payload: {
-                newValue,
-                sources: [...selectedSources],
-                fast: true   // signal popup to use the fast path
-            }
-        }).catch(() => { });
+        chrome.runtime
+            .sendMessage({
+                type: 'SIDEPANEL_COLOR_CHANGED',
+                payload: {
+                    newValue,
+                    sources: [...selectedSources],
+                    fast: true, // signal popup to use the fast path
+                    tabId: currentTabId,
+                },
+            })
+            .catch((err) => {
+                console.warn('PaletteLive: Side panel message failed', err);
+            });
     });
 
     colorPicker.addEventListener('input', (event) => {
@@ -211,45 +220,55 @@ document.addEventListener('DOMContentLoaded', () => {
     colorPicker.addEventListener('change', () => {
         if (!selectedSources.length) return;
         const finalValue = normalizeHex(colorPicker.value);
+        if (!finalValue) return;
 
         // If real-time was off, this is the first time the page gets updated
         if (!realtimeToggle.checked) {
-            chrome.runtime.sendMessage({
-                type: 'SIDEPANEL_COLOR_CHANGED',
-                payload: {
-                    newValue: finalValue,
-                    sources: [...selectedSources],
-                    fast: false   // full override path
-                }
-            }).catch(() => { });
+            chrome.runtime
+                .sendMessage({
+                    type: 'SIDEPANEL_COLOR_CHANGED',
+                    payload: {
+                        newValue: finalValue,
+                        sources: [...selectedSources],
+                        fast: false, // full override path
+                        tabId: currentTabId,
+                    },
+                })
+                .catch(() => {});
         }
 
         // Always commit for history + full fallback CSS
-        chrome.runtime.sendMessage({
-            type: 'SIDEPANEL_COLOR_COMMITTED',
-            payload: {
-                finalValue,
-                sources: [...selectedSources],
-                startValues: Object.fromEntries(editStartValues)
-            }
-        }).catch(() => { });
+        chrome.runtime
+            .sendMessage({
+                type: 'SIDEPANEL_COLOR_COMMITTED',
+                payload: {
+                    finalValue,
+                    sources: [...selectedSources],
+                    startValues: Object.fromEntries(editStartValues),
+                    tabId: currentTabId,
+                },
+            })
+            .catch(() => {});
         // Update start values
-        selectedSources.forEach(source => {
+        selectedSources.forEach((source) => {
             editStartValues.set(source, finalValue);
         });
-        editStartValue = finalValue;
+        _editStartValue = finalValue;
     });
 
     // --- Export toggle ---
     exportSelectToggle.addEventListener('change', () => {
         if (!selectedSources.length) return;
-        chrome.runtime.sendMessage({
-            type: 'SIDEPANEL_EXPORT_TOGGLED',
-            payload: {
-                checked: exportSelectToggle.checked,
-                sources: [...selectedSources]
-            }
-        }).catch(() => { });
+        chrome.runtime
+            .sendMessage({
+                type: 'SIDEPANEL_EXPORT_TOGGLED',
+                payload: {
+                    checked: exportSelectToggle.checked,
+                    sources: [...selectedSources],
+                    tabId: currentTabId,
+                },
+            })
+            .catch(() => {});
     });
 
     // --- Batch apply ---
@@ -257,13 +276,16 @@ document.addEventListener('DOMContentLoaded', () => {
         batchApplyBtn.addEventListener('click', () => {
             if (!selectedSources.length) return;
             const targetHex = sanitizePickerHex(colorPicker.value);
-            chrome.runtime.sendMessage({
-                type: 'SIDEPANEL_BATCH_APPLY',
-                payload: {
-                    targetHex,
-                    sources: [...selectedSources]
-                }
-            }).catch(() => { });
+            chrome.runtime
+                .sendMessage({
+                    type: 'SIDEPANEL_BATCH_APPLY',
+                    payload: {
+                        targetHex,
+                        sources: [...selectedSources],
+                        tabId: currentTabId,
+                    },
+                })
+                .catch(() => {});
         });
     }
 
@@ -277,10 +299,11 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         if (message.type === 'SIDEPANEL_UPDATE_EXPORT') {
-            exportSelectToggle.checked = !!message.payload.checked;
+            if (message.payload) exportSelectToggle.checked = !!message.payload.checked;
         }
 
         if (message.type === 'SIDEPANEL_UPDATE_COLOR') {
+            if (!message.payload) return;
             const hex = sanitizePickerHex(message.payload.hex);
             colorPicker.value = hex;
             updateSelectedLabel(hex);

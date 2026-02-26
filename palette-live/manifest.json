@@ -1,66 +1,51 @@
 {
-  "manifest_version": 3,
-  "name": "PaletteLive",
-  "version": "1.0.0",
-  "description": "Extract, edit, and export color palettes from any website live.",
-  "permissions": [
-    "activeTab",
-    "scripting",
-    "storage",
-    "sidePanel"
-  ],
-  "host_permissions": [
-    "<all_urls>"
-  ],
-  "action": {
-    "default_popup": "popup/popup.html",
-    "default_title": "PaletteLive",
-    "default_icon": {
-      "16": "assets/icon16.png",
-      "48": "assets/icon48.png",
-      "128": "assets/icon128.png"
+    "manifest_version": 3,
+    "name": "PaletteLive",
+    "version": "1.0.0",
+    "description": "Extract, edit, and export color palettes from any website live.",
+    "permissions": ["activeTab", "scripting", "storage", "sidePanel"],
+    "host_permissions": ["<all_urls>"],
+    "action": {
+        "default_popup": "popup/popup.html",
+        "default_title": "PaletteLive",
+        "default_icon": {
+            "16": "assets/icon16.png",
+            "48": "assets/icon48.png",
+            "128": "assets/icon128.png"
+        }
+    },
+    "content_security_policy": {
+        "extension_pages": "script-src 'self'; object-src 'self'; style-src 'self' 'unsafe-inline'"
+    },
+    "side_panel": {
+        "default_path": "sidepanel/sidepanel.html"
+    },
+    "background": {
+        "service_worker": "background.js"
+    },
+    "content_scripts": [
+        {
+            "matches": ["<all_urls>"],
+            "js": [
+                "utils/constants.js",
+                "utils/colorUtils.js",
+                "utils/colorNames.js",
+                "utils/contrast.js",
+                "utils/storage.js",
+                "content/shadowWalker.js",
+                "content/extractor.js",
+                "content/injector.js",
+                "content/heatmap.js",
+                "content/dropper.js",
+                "content/content.js"
+            ],
+            "all_frames": true,
+            "run_at": "document_idle"
+        }
+    ],
+    "icons": {
+        "16": "assets/icon16.png",
+        "48": "assets/icon48.png",
+        "128": "assets/icon128.png"
     }
-  },
-  "side_panel": {
-    "default_path": "sidepanel/sidepanel.html"
-  },
-  "background": {
-    "service_worker": "background.js"
-  },
-  "content_scripts": [
-    {
-      "matches": [
-        "<all_urls>"
-      ],
-      "js": [
-        "utils/colorUtils.js",
-        "utils/colorNames.js",
-        "utils/contrast.js",
-        "utils/storage.js",
-        "content/shadowWalker.js",
-        "content/extractor.js",
-        "content/injector.js",
-        "content/heatmap.js",
-        "content/dropper.js",
-        "content/content.js"
-      ],
-      "all_frames": true,
-      "run_at": "document_idle"
-    }
-  ],
-  "icons": {
-    "16": "assets/icon16.png",
-    "48": "assets/icon48.png",
-    "128": "assets/icon128.png"
-  },
-  "web_accessible_resources": [
-    {
-      "resources": [
-        "assets/*"
-      ],
-      "matches": [
-        "<all_urls>"
-      ]
-    }
-  ]
 }

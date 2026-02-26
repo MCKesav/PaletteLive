@@ -4,7 +4,7 @@
  */
 
 // Guard against re-injection - use version to allow updates
-const _SHADOW_WALKER_VERSION = 3;
+var _SHADOW_WALKER_VERSION = 3;
 if (window._shadowWalkerVersion === _SHADOW_WALKER_VERSION) {
     // Already loaded with same version
 } else {
@@ -14,34 +14,40 @@ if (window._shadowWalkerVersion === _SHADOW_WALKER_VERSION) {
         // Counter for closed Shadow DOM hosts detected during walks
         closedShadowCount: 0,
 
+        // Maximum recursion depth for nested shadow roots to prevent stack overflow
+        MAX_SHADOW_DEPTH: 30,
+
+        // Maximum total elements collected by getAllElements to prevent OOM
+        MAX_ELEMENTS: 50000,
+
         /**
          * Traverse all nodes including those in open Shadow roots
          * @param {Node} root - Starting node (usually document.body)
-         * @param {Function} callback - Function to execute for each element
+         * @param {Function} callback - Function to execute for each element; return false to stop walk
+         * @param {number} [depth=0] - Current shadow DOM nesting depth (internal)
          */
-        walk: (root, callback) => {
+        walk: (root, callback, depth = 0) => {
             if (!root) return;
+
+            // Prevent stack overflow from deeply nested shadow DOMs
+            if (depth > ShadowWalker.MAX_SHADOW_DEPTH) return;
 
             // Process the root itself if it is an element (e.g. document.body)
             // ShadowRoots are DocumentFragments (nodeType 11), so they are skipped here
-            if (root.nodeType === 1) { // Node.ELEMENT_NODE
-                callback(root);
+            if (root.nodeType === 1) {
+                // Node.ELEMENT_NODE
+                if (callback(root) === false) return false;
             }
 
-            const walker = document.createTreeWalker(
-                root,
-                NodeFilter.SHOW_ELEMENT,
-                null,
-                false
-            );
+            const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, null, false);
 
             let node = walker.nextNode();
             while (node) {
-                callback(node);
+                if (callback(node) === false) return false;
 
                 // Check for Shadow Root
                 if (node.shadowRoot && node.shadowRoot.mode === 'open') {
-                    ShadowWalker.walk(node.shadowRoot, callback);
+                    if (ShadowWalker.walk(node.shadowRoot, callback, depth + 1) === false) return false;
                 }
 
                 // Detect closed Shadow DOMs (element has shadow host behavior but no accessible shadowRoot)
@@ -49,9 +55,17 @@ if (window._shadowWalkerVersion === _SHADOW_WALKER_VERSION) {
                 // may render content inside them that we can't access.
                 // NOTE: getBoundingClientRect() is intentionally avoided here because calling it
                 // for every empty element forces a synchronous layout reflow, which can freeze
-                // the page on large DOMs. We use a simple structural heuristic instead.
-                if (!node.shadowRoot && node.attachShadow && node.innerHTML === '' &&
-                    node.childElementCount === 0 && node.children.length === 0) {
+                // the page on large DOMs. We use a structural heuristic: the element must be
+                // a valid shadow host (has attachShadow) with no light DOM children.
+                // Checking childElementCount is sufficient and avoids innerHTML which triggers
+                // HTML serialization of the entire subtree.
+                if (
+                    !node.shadowRoot &&
+                    node.attachShadow &&
+                    node.tagName && node.tagName.includes('-') &&
+                    node.childElementCount === 0 &&
+                    node.childNodes.length === 0
+                ) {
                     ShadowWalker.closedShadowCount++;
                 }
 
@@ -66,11 +80,18 @@ if (window._shadowWalkerVersion === _SHADOW_WALKER_VERSION) {
         getAllElements: () => {
             ShadowWalker.closedShadowCount = 0; // Reset counter each scan
             const elements = [];
-            ShadowWalker.walk(document.body, (el) => elements.push(el));
+            let stopped = false;
+            ShadowWalker.walk(document.body, (el) => {
+                if (stopped) return false;
+                elements.push(el);
+                if (elements.length >= ShadowWalker.MAX_ELEMENTS) {
+                    stopped = true;
+                    return false;
+                }
+            });
             return elements;
-        }
+        },
     };
 
     window.ShadowWalker = ShadowWalker;
-
 } // end re-injection guard

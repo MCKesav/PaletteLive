@@ -5,7 +5,8 @@
  */
 
 // Guard against re-injection - use version to allow updates
-const _DROPPER_VERSION = 2;
+// eslint-disable-next-line no-var -- must be var for cross-script re-injection guard
+var _DROPPER_VERSION = 2;
 if (window._dropperVersion === _DROPPER_VERSION) {
     // Already loaded with same version
 } else {
@@ -30,6 +31,13 @@ if (window._dropperVersion === _DROPPER_VERSION) {
             // If an editor is already open, close it first
             if (Dropper._editor) Dropper._closeEditor();
             Dropper._active = true;
+            // Suspend watchdog/observer background work while dropper is live
+            try {
+                if (window.dispatchSecureDropperEvent)
+                    window.dispatchSecureDropperEvent('pl-dropper-active', { active: true });
+            } catch (e) {
+                /* ignore */
+            }
             Dropper._createOverlay();
         },
 
@@ -38,6 +46,13 @@ if (window._dropperVersion === _DROPPER_VERSION) {
             Dropper._removeOverlay();
             Dropper._closeEditor();
             Dropper._active = false;
+            // Resume background work
+            try {
+                if (window.dispatchSecureDropperEvent)
+                    window.dispatchSecureDropperEvent('pl-dropper-active', { active: false });
+            } catch (e) {
+                /* ignore */
+            }
         },
 
         // ── Overlay (crosshair + preview) ─────────────────────────────
@@ -57,12 +72,19 @@ if (window._dropperVersion === _DROPPER_VERSION) {
                 'position:fixed;pointer-events:none;display:none;flex-direction:column;' +
                 'align-items:center;gap:4px;z-index:2147483647;' +
                 'transform:translate(-50%,-130%);filter:drop-shadow(0 2px 8px rgba(0,0,0,0.25));';
-            preview.innerHTML =
-                '<div id="pl-dropper-swatch" style="width:44px;height:44px;border-radius:50%;' +
-                'border:3px solid #fff;box-shadow:0 0 0 1px rgba(0,0,0,0.2);"></div>' +
-                '<div id="pl-dropper-label" style="background:#1e293b;color:#fff;font-size:11px;' +
+            const swatch = document.createElement('div');
+            swatch.id = 'pl-dropper-swatch';
+            swatch.style.cssText =
+                'width:44px;height:44px;border-radius:50%;' +
+                'border:3px solid #fff;box-shadow:0 0 0 1px rgba(0,0,0,0.2);';
+            const label = document.createElement('div');
+            label.id = 'pl-dropper-label';
+            label.style.cssText =
+                'background:#1e293b;color:#fff;font-size:11px;' +
                 'font-family:Courier New,monospace;font-weight:600;padding:2px 8px;' +
-                'border-radius:4px;white-space:nowrap;"></div>';
+                'border-radius:4px;white-space:nowrap;';
+            preview.appendChild(swatch);
+            preview.appendChild(label);
 
             // Hint banner
             const hint = document.createElement('div');
@@ -74,6 +96,8 @@ if (window._dropperVersion === _DROPPER_VERSION) {
                 'border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,0.3);pointer-events:none;' +
                 'user-select:none;';
             hint.textContent = 'Click any element to pick and edit its color - Esc to cancel';
+            hint.setAttribute('role', 'status');
+            hint.setAttribute('aria-live', 'polite');
 
             document.documentElement.appendChild(overlay);
             document.documentElement.appendChild(preview);
@@ -92,11 +116,17 @@ if (window._dropperVersion === _DROPPER_VERSION) {
             // Clear any dropper-driven highlights before removing overlay
             Dropper._lastHighlightHex = null;
             Dropper._lastHighlightElement = null;
+            Dropper._lastHitElement = null;
+            Dropper._lastHitHex = null;
+            Dropper._lastHitPickedElement = null;
+            Dropper._lastHitStyle = null;
             try {
                 if (window.__plClearHighlight) {
                     window.__plClearHighlight();
                 }
-            } catch (err) { /* ignore */ }
+            } catch (err) {
+                /* ignore */
+            }
 
             if (Dropper._overlay) {
                 Dropper._overlay.removeEventListener('mousemove', Dropper._onMove);
@@ -104,8 +134,14 @@ if (window._dropperVersion === _DROPPER_VERSION) {
                 Dropper._overlay.remove();
                 Dropper._overlay = null;
             }
-            if (Dropper._preview) { Dropper._preview.remove(); Dropper._preview = null; }
-            if (Dropper._hint) { Dropper._hint.remove(); Dropper._hint = null; }
+            if (Dropper._preview) {
+                Dropper._preview.remove();
+                Dropper._preview = null;
+            }
+            if (Dropper._hint) {
+                Dropper._hint.remove();
+                Dropper._hint = null;
+            }
             document.removeEventListener('keydown', Dropper._onKey);
         },
 
@@ -128,9 +164,7 @@ if (window._dropperVersion === _DROPPER_VERSION) {
                 const nearTop = y < 100;
                 preview.style.left = x + 'px';
                 preview.style.top = y + 'px';
-                preview.style.transform = nearTop
-                    ? 'translate(-50%, 30px)'
-                    : 'translate(-50%, -130%)';
+                preview.style.transform = nearTop ? 'translate(-50%, 30px)' : 'translate(-50%, -130%)';
                 preview.style.display = 'flex';
 
                 const swatch = document.getElementById('pl-dropper-swatch');
@@ -139,7 +173,10 @@ if (window._dropperVersion === _DROPPER_VERSION) {
                 if (label) label.textContent = color;
 
                 // Highlight ONLY the element under the cursor (much faster than scanning the whole page)
-                if (Dropper._lastHighlightElement !== Dropper._lastPickedElement || Dropper._lastHighlightHex !== color) {
+                if (
+                    Dropper._lastHighlightElement !== Dropper._lastPickedElement ||
+                    Dropper._lastHighlightHex !== color
+                ) {
                     Dropper._lastHighlightElement = Dropper._lastPickedElement;
                     Dropper._lastHighlightHex = color;
                     try {
@@ -148,7 +185,9 @@ if (window._dropperVersion === _DROPPER_VERSION) {
                         } else if (!Dropper._lastPickedElement && window.__plClearHighlight) {
                             window.__plClearHighlight();
                         }
-                    } catch (err) { /* ignore */ }
+                    } catch (err) {
+                        /* ignore */
+                    }
                 }
             });
         },
@@ -165,6 +204,13 @@ if (window._dropperVersion === _DROPPER_VERSION) {
             // Remove overlay, show inline editor
             Dropper._removeOverlay();
             Dropper._active = false;
+            // Resume background work now that dropper interaction is complete
+            try {
+                if (window.dispatchSecureDropperEvent)
+                    window.dispatchSecureDropperEvent('pl-dropper-active', { active: false });
+            } catch (e) {
+                /* ignore */
+            }
             Dropper._showEditor(clickX, clickY, hex);
         },
 
@@ -175,21 +221,55 @@ if (window._dropperVersion === _DROPPER_VERSION) {
         // ── Inline color editor ───────────────────────────────────────
 
         _showEditor: (x, y, originalHex) => {
-            // Send message to background to open the compact popup window
+            // Ask the popup to resolve this hex into its full cluster (merged shades)
             try {
-                chrome.runtime.sendMessage({
-                    type: 'OPEN_EDITOR_WINDOW',
-                    payload: {
-                        color: {
-                            value: originalHex,
-                            hex: originalHex
-                        },
-                        currentHex: originalHex,
-                        sources: [originalHex] // This tells the panel which color to override on the page
+                chrome.runtime.sendMessage(
+                    { type: 'DROPPER_RESOLVE_CLUSTER', payload: { hex: originalHex } },
+                    (response) => {
+                        if (chrome.runtime.lastError) {
+                            console.warn('PaletteLive: Error resolving cluster', chrome.runtime.lastError.message);
+                        }
+                        // Build payload from cluster resolution or fall back to single hex
+                        const resolved = response && response.sources && response.sources.length > 0 ? response : null;
+
+                        const payload = resolved
+                            ? {
+                                  color: resolved.color || { value: originalHex, hex: originalHex },
+                                  currentHex: originalHex,
+                                  sources: resolved.sources,
+                                  effectiveValues: resolved.effectiveValues || {},
+                              }
+                            : {
+                                  color: { value: originalHex, hex: originalHex },
+                                  currentHex: originalHex,
+                                  sources: [originalHex],
+                              };
+
+                        chrome.runtime.sendMessage({
+                            type: 'OPEN_EDITOR_WINDOW',
+                            payload,
+                        });
                     }
-                });
+                );
             } catch (error) {
-                console.error('PaletteLive: Could not open editor window', error);
+                // Fallback: open editor with just the single picked hex.
+                // Do NOT log as error — context invalidation is expected after extension reload.
+                if (error && error.message && error.message.includes('Extension context invalidated')) {
+                    return; // Extension was reloaded; nothing can be done in this context.
+                }
+                console.warn('PaletteLive: Could not resolve cluster, falling back', error);
+                try {
+                    chrome.runtime.sendMessage({
+                        type: 'OPEN_EDITOR_WINDOW',
+                        payload: {
+                            color: { value: originalHex, hex: originalHex },
+                            currentHex: originalHex,
+                            sources: [originalHex],
+                        },
+                    });
+                } catch (e) {
+                    /* context invalidated — extension was reloaded; nothing to do */
+                }
             }
         },
 
@@ -199,33 +279,45 @@ if (window._dropperVersion === _DROPPER_VERSION) {
 
         // ── Shared helpers ────────────────────────────────────────────
 
+        // Cache last element + hex to avoid redundant getComputedStyle walks
+        _lastHitElement: null,
+        _lastHitHex: null,
+        _lastHitPickedElement: null,
+        _lastHitStyle: null,
+
         /** Read the dominant visible color at a screen coordinate */
         _colorAtPoint: (x, y) => {
             let hex = '#000000';
             Dropper._lastPickedElement = null;
 
             try {
-                // Temporarily hide all dropper UI elements so that
-                // document.elementFromPoint returns the ACTUAL page element
-                // the user sees at this coordinate.
-                // This runs synchronously within one JS task, so no visual flicker.
-                const hiddenEls = [];
-                ['pl-dropper-overlay', 'pl-dropper-preview', 'pl-dropper-hint'].forEach(id => {
-                    const el = document.getElementById(id);
-                    if (el) {
-                        el.style.visibility = 'hidden';
-                        hiddenEls.push(el);
-                    }
-                });
-
-                // elementFromPoint (singular) returns the true topmost element,
-                // respecting overflow clipping, z-index stacking, and visibility.
-                const topEl = document.elementFromPoint(x, y);
-
-                // Restore dropper elements immediately (same sync task = no flicker)
-                hiddenEls.forEach(el => { el.style.visibility = ''; });
+                // Use elementsFromPoint (plural) and skip dropper UI nodes —
+                // avoids toggling visibility which triggers a layout reflow every frame.
+                const DROPPER_IDS = new Set([
+                    'pl-dropper-overlay',
+                    'pl-dropper-preview',
+                    'pl-dropper-hint',
+                    'pl-dropper-swatch',
+                    'pl-dropper-label',
+                ]);
+                const allEls = document.elementsFromPoint(x, y);
+                const topEl = allEls.find((el) => !DROPPER_IDS.has(el.id)) || null;
 
                 if (topEl) {
+                    // Fast path: if the same element as last frame, return cached hex
+                    if (topEl === Dropper._lastHitElement && Dropper._lastHitHex) {
+                        try {
+                            const target = Dropper._lastHitPickedElement || topEl;
+                            const cs = window.getComputedStyle(target);
+                            if (cs.backgroundColor + '|' + cs.color + '|' + cs.backgroundImage === Dropper._lastHitStyle) {
+                                Dropper._lastPickedElement = target;
+                                return Dropper._lastHitHex;
+                            }
+                        } catch (e) {
+                            /* fallback to full scan */
+                        }
+                    }
+
                     // Walk up the DOM tree from the hit element to find the
                     // nearest ancestor with a visible background color. This
                     // mirrors what the user actually sees: the hit element on
@@ -233,8 +325,10 @@ if (window._dropperVersion === _DROPPER_VERSION) {
                     // etc.) behind it.
                     let current = topEl;
                     let found = false;
+                    let depthLimit = 20; // cap to avoid deep-DOM performance issues
 
                     while (current) {
+                        if (depthLimit-- <= 0) break;
                         try {
                             const cs = window.getComputedStyle(current);
 
@@ -249,6 +343,7 @@ if (window._dropperVersion === _DROPPER_VERSION) {
                             if (bg && !window.ColorUtils.isTransparent(bg)) {
                                 hex = window.ColorUtils.rgbToHex8(bg).toLowerCase();
                                 Dropper._lastPickedElement = current;
+                                Dropper._lastHitPickedElement = current;
                                 found = true;
                                 break;
                             }
@@ -262,12 +357,15 @@ if (window._dropperVersion === _DROPPER_VERSION) {
                                     if (gradHex && !window.ColorUtils.isTransparent(colorMatch[0])) {
                                         hex = gradHex;
                                         Dropper._lastPickedElement = current;
+                                        Dropper._lastHitPickedElement = current;
                                         found = true;
                                         break;
                                     }
                                 }
                             }
-                        } catch (e) { /* skip inaccessible elements */ }
+                        } catch (e) {
+                            /* skip inaccessible elements */
+                        }
 
                         current = current.parentElement;
                     }
@@ -280,8 +378,21 @@ if (window._dropperVersion === _DROPPER_VERSION) {
                             if (fg && !window.ColorUtils.isTransparent(fg)) {
                                 hex = window.ColorUtils.rgbToHex8(fg).toLowerCase();
                                 Dropper._lastPickedElement = topEl;
+                                Dropper._lastHitPickedElement = topEl;
                             }
-                        } catch (e) { /* skip */ }
+                        } catch (e) {
+                            /* skip */
+                        }
+                    }
+
+                    Dropper._lastHitElement = topEl;
+                    Dropper._lastHitHex = hex;
+                    try {
+                        const target = Dropper._lastHitPickedElement || topEl;
+                        const cs = window.getComputedStyle(target);
+                        Dropper._lastHitStyle = cs.backgroundColor + '|' + cs.color + '|' + cs.backgroundImage;
+                    } catch (e) {
+                        Dropper._lastHitStyle = null;
                     }
                 }
             } catch (err) {
@@ -289,9 +400,8 @@ if (window._dropperVersion === _DROPPER_VERSION) {
             }
 
             return hex;
-        }
+        },
     };
 
     window.Dropper = Dropper;
-
 } // end re-injection guard

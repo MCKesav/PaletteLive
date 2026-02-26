@@ -11,7 +11,7 @@
     window.__paletteLiveLoaded = CONTENT_SCRIPT_VERSION;
     window.__paletteLiveReady = false; // Will be set true after full initialization
 
-    console.log('PaletteLive content script loaded (v' + CONTENT_SCRIPT_VERSION + ')');
+    PLLog.info('Content script loaded (v' + CONTENT_SCRIPT_VERSION + ')');
 
     // Generate a secret token for secure dropper events (prevents spoofed DOM events)
     const _plDropperSecret = crypto.getRandomValues(new Uint32Array(4)).join('-');
@@ -26,9 +26,11 @@
 
     // Helper for Dropper to dispatch secure events
     function dispatchSecureDropperEvent(eventName, data) {
-        window.dispatchEvent(new CustomEvent(eventName, {
-            detail: { ...data, _plSecret: _plDropperSecret }
-        }));
+        window.dispatchEvent(
+            new CustomEvent(eventName, {
+                detail: { ...data, _plSecret: _plDropperSecret },
+            })
+        );
     }
 
     // Key: normalized source hex color, Value: Array of { element, cssProp }
@@ -37,6 +39,47 @@
     // WeakMap<Element, Map<cssProp, { hadInline, value, priority }>>
     const overrideMap = new WeakMap();
     let overrideRefs = [];
+
+    // Periodically prune dead WeakRefs to prevent unbounded array growth.
+    // Runs every 60s — lightweight O(n) scan that removes dereferenced entries.
+    const _WEAKREF_PRUNE_INTERVAL_MS = PLConfig.WEAKREF_PRUNE_INTERVAL_MS;
+    let _weakRefPruneTimer = null;
+
+    function startWeakRefPruneTimer() {
+        if (_weakRefPruneTimer) clearInterval(_weakRefPruneTimer);
+        _weakRefPruneTimer = setInterval(() => {
+            const before = overrideRefs.length;
+            overrideRefs = overrideRefs.filter((ref) => ref.deref() !== undefined);
+            if (before !== overrideRefs.length) {
+                PLLog.debug(
+                    `PaletteLive: Pruned ${before - overrideRefs.length} dead WeakRefs (${overrideRefs.length} remaining)`
+                );
+            }
+
+            // Prune colorElementMap — remove entries referencing detached DOM nodes.
+            // On infinite-scroll / SPA pages, elements are added via processAddedSubtree
+            // but never removed, causing unbounded Map growth.
+            let prunedEntries = 0;
+            for (const [hex, entries] of colorElementMap) {
+                const beforeLen = entries.length;
+                const filtered = entries.filter((e) => e.element && e.element.isConnected);
+                if (filtered.length !== beforeLen) {
+                    prunedEntries += beforeLen - filtered.length;
+                    if (filtered.length === 0) {
+                        colorElementMap.delete(hex);
+                    } else {
+                        colorElementMap.set(hex, filtered);
+                    }
+                }
+            }
+            if (prunedEntries > 0) {
+                PLLog.debug(
+                    `PaletteLive: Pruned ${prunedEntries} detached element refs from colorElementMap (${colorElementMap.size} colors remaining)`
+                );
+            }
+        }, _WEAKREF_PRUNE_INTERVAL_MS);
+    }
+    startWeakRefPruneTimer();
 
     // Track fallback classes that PaletteLive adds so reset removes only our classes.
     const addedFallbackClasses = new Set();
@@ -63,8 +106,68 @@
     let isRescanning = false;
     const pendingOverrides = [];
 
+    // ── Scan result cache ──────────────────────────────────────────
+    // Caches the last Extractor.scan() result in memory so reopening the
+    // popup on the same page is instant (no DOM re-walk).
+    // Invalidated on SPA navigation or when the user explicitly rescans.
+    const _SCAN_CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes
+    let _scanCache = null; // { url: string, data: object, ts: number } | null
+
     // Paused state — when true, all background activity is suspended
     let __plPaused = false;
+
+    // ── Extension context invalidation detection ───────────────────
+    // When the extension is updated/reloaded, the content script's context
+    // becomes invalid and all chrome.runtime.* calls will throw.
+    let _plContextInvalidated = false;
+
+    /**
+     * Safely send a message via chrome.runtime.sendMessage.
+     * Detects context invalidation and gracefully degrades.
+     */
+    function safeSendRuntimeMessage(message, callback) {
+        if (_plContextInvalidated) return;
+        try {
+            chrome.runtime.sendMessage(message, (response) => {
+                if (chrome.runtime.lastError) {
+                    const msg = chrome.runtime.lastError.message || '';
+                    // "message port closed" just means the popup was closed while
+                    // we were sending — this is normal after dropper/compare use.
+                    // Only a true "Extension context invalidated" error means our
+                    // own execution context is gone and we should stop all activity.
+                    if (msg.includes('Extension context invalidated')) {
+                        _plContextInvalidated = true;
+                        _handleContextInvalidation();
+                        return;
+                    }
+                    // Silently swallow other transient errors (receiving end gone, etc.)
+                    return;
+                }
+                if (typeof callback === 'function') callback(response);
+            });
+        } catch (error) {
+            if (error.message && error.message.includes('Extension context invalidated')) {
+                _plContextInvalidated = true;
+                _handleContextInvalidation();
+            }
+        }
+    }
+
+    /**
+     * Clean up when extension context is invalidated.
+     * Stops all timers, observers, and background activity.
+     */
+    function _handleContextInvalidation() {
+        PLLog.info('Extension context invalidated (extension was updated or reloaded). Gracefully stopping activity.');
+        __plPaused = true;
+        stopObserver();
+        stopOverrideWatchdog();
+        clearTimeout(rebuildTimer);
+        clearTimeout(_plScrollReapplyTimer);
+        clearTimeout(_plRouteTimer);
+        clearInterval(_weakRefPruneTimer);
+        _weakRefPruneTimer = null;
+    }
 
     // ── Image container detection ──────────────────────────────────
     // Media tag names that display images/video — background-color overrides
@@ -72,29 +175,79 @@
     const _MEDIA_TAGS = new Set(['IMG', 'VIDEO', 'CANVAS', 'PICTURE', 'SOURCE']);
 
     /**
-     * Returns true if the element is a media element or directly wraps one
-     * (up to `depth` levels of descendants).  Used to skip background-color
-     * overrides that would obscure the image/video content.
+     * Returns true if the element is a media element or tightly wraps one.
+     * Used to skip background-color overrides that would obscure images/videos.
+     *
+     * Hybrid approach:
+     *  1. Element IS a media tag → skip
+     *  2. Element has background-image url() → skip
+     *  3. Element is a TIGHT wrapper around a media descendant (within 2 levels,
+     *     media covers >50% of container area) → skip
+     *  4. Otherwise (large layout containers like <body>, <main>) → allow override
      */
     function _isImageContainer(element) {
         if (_MEDIA_TAGS.has(element.tagName)) return true;
-        // Also skip if element has a background-image url (image set via CSS)
+        // Skip if element has a background-image url (image set via CSS)
         try {
             const bgImg = window.getComputedStyle(element).backgroundImage;
             if (bgImg && bgImg !== 'none' && bgImg.includes('url(')) return true;
-        } catch (e) { /* ignore */ }
-        return _hasMediaDescendant(element, 3);
+        } catch (e) {
+            /* ignore */
+        }
+        return _isTightMediaWrapper(element);
     }
 
-    function _hasMediaDescendant(element, depth) {
-        if (depth <= 0) return false;
+    /**
+     * Checks up to 2 levels of descendants for media elements. Returns true only
+     * if a media child occupies a significant portion (>50%) of the container's
+     * area — i.e. the element is a tight image/video wrapper, not a large layout
+     * container that happens to contain images somewhere in its subtree.
+     */
+    function _isTightMediaWrapper(element) {
+        let containerRect = null;
+        const getContainerRect = () => {
+            if (!containerRect) {
+                try {
+                    containerRect = element.getBoundingClientRect();
+                } catch (e) {
+                    return null;
+                }
+            }
+            return containerRect;
+        };
+
         const children = element.children;
-        if (!children) return false;
+        if (!children || !children.length) return false;
+
         for (let i = 0; i < children.length; i++) {
-            if (_MEDIA_TAGS.has(children[i].tagName)) return true;
-            if (_hasMediaDescendant(children[i], depth - 1)) return true;
+            const child = children[i];
+            if (_MEDIA_TAGS.has(child.tagName) && _mediaFillsContainer(child, getContainerRect)) return true;
+            // Check one more level (grandchildren)
+            const grandchildren = child.children;
+            if (grandchildren) {
+                for (let j = 0; j < grandchildren.length; j++) {
+                    if (
+                        _MEDIA_TAGS.has(grandchildren[j].tagName) &&
+                        _mediaFillsContainer(grandchildren[j], getContainerRect)
+                    )
+                        return true;
+                }
+            }
         }
         return false;
+    }
+
+    /** Returns true if the media element covers >50% of the container's width AND height */
+    function _mediaFillsContainer(mediaEl, getContainerRect) {
+        try {
+            const cRect = getContainerRect();
+            if (!cRect || cRect.width === 0 || cRect.height === 0) return false;
+            const mRect = mediaEl.getBoundingClientRect();
+            if (mRect.width === 0 && mRect.height === 0) return false;
+            return mRect.width / cRect.width > 0.5 && mRect.height / cRect.height > 0.5;
+        } catch (e) {
+            return false;
+        }
     }
 
     /**
@@ -121,10 +274,10 @@
             }
             // Remove fallback CSS classes (pl-bg-*)
             const toRemove = [];
-            parent.classList.forEach(cls => {
+            parent.classList.forEach((cls) => {
                 if (cls.startsWith('pl-bg-')) toRemove.push(cls);
             });
-            toRemove.forEach(cls => parent.classList.remove(cls));
+            toRemove.forEach((cls) => parent.classList.remove(cls));
             parent = parent.parentElement;
         }
     }
@@ -139,10 +292,19 @@
     }
 
     function waitForStyleSettle() {
-        return new Promise(resolve => {
+        return new Promise((resolve) => {
+            let settled = false;
+            const done = () => {
+                if (!settled) {
+                    settled = true;
+                    resolve();
+                }
+            };
             requestAnimationFrame(() => {
-                requestAnimationFrame(resolve);
+                requestAnimationFrame(done);
             });
+            // Fallback: if rAF is throttled (background tab), settle after 100ms
+            setTimeout(done, 100);
         });
     }
 
@@ -200,14 +362,31 @@
         svg.style.height = '0';
         svg.style.pointerEvents = 'none';
 
-        svg.innerHTML = [
-            '<defs>',
-            '<filter id="pl-vision-protanopia"><feColorMatrix type="matrix" values="0.567 0.433 0 0 0 0.558 0.442 0 0 0 0 0.242 0.758 0 0 0 0 0 1 0"/></filter>',
-            '<filter id="pl-vision-deuteranopia"><feColorMatrix type="matrix" values="0.625 0.375 0 0 0 0.7 0.3 0 0 0 0 0.3 0.7 0 0 0 0 0 1 0"/></filter>',
-            '<filter id="pl-vision-tritanopia"><feColorMatrix type="matrix" values="0.95 0.05 0 0 0 0 0.433 0.567 0 0 0 0.475 0.525 0 0 0 0 0 1 0"/></filter>',
-            '<filter id="pl-vision-achromatopsia"><feColorMatrix type="matrix" values="0.299 0.587 0.114 0 0 0.299 0.587 0.114 0 0 0.299 0.587 0.114 0 0 0 0 0 1 0"/></filter>',
-            '</defs>'
-        ].join('');
+        // Build SVG filter defs using DOM API instead of innerHTML to prevent XSS
+        const NS = 'http://www.w3.org/2000/svg';
+        const defs = document.createElementNS(NS, 'defs');
+
+        const filters = [
+            { id: 'pl-vision-protanopia', values: '0.567 0.433 0 0 0 0.558 0.442 0 0 0 0 0.242 0.758 0 0 0 0 0 1 0' },
+            { id: 'pl-vision-deuteranopia', values: '0.625 0.375 0 0 0 0.7 0.3 0 0 0 0 0.3 0.7 0 0 0 0 0 1 0' },
+            { id: 'pl-vision-tritanopia', values: '0.95 0.05 0 0 0 0 0.433 0.567 0 0 0 0.475 0.525 0 0 0 0 0 1 0' },
+            {
+                id: 'pl-vision-achromatopsia',
+                values: '0.299 0.587 0.114 0 0 0.299 0.587 0.114 0 0 0.299 0.587 0.114 0 0 0 0 0 1 0',
+            },
+        ];
+
+        filters.forEach(({ id, values }) => {
+            const filter = document.createElementNS(NS, 'filter');
+            filter.setAttribute('id', id);
+            const matrix = document.createElementNS(NS, 'feColorMatrix');
+            matrix.setAttribute('type', 'matrix');
+            matrix.setAttribute('values', values);
+            filter.appendChild(matrix);
+            defs.appendChild(filter);
+        });
+
+        svg.appendChild(defs);
 
         document.documentElement.appendChild(svg);
     }
@@ -233,7 +412,7 @@
         if (!Array.isArray(variableNames) || !window.Injector || !window.Injector.state) return;
 
         let changed = false;
-        variableNames.forEach(name => {
+        variableNames.forEach((name) => {
             if (Object.prototype.hasOwnProperty.call(window.Injector.state.variables, name)) {
                 delete window.Injector.state.variables[name];
                 changed = true;
@@ -250,7 +429,7 @@
         if (payload.raw) {
             // Handle batched overrides (array of raw overrides)
             if (Array.isArray(payload.raw)) {
-                payload.raw.forEach(raw => {
+                payload.raw.forEach((raw) => {
                     totalApplied += applyRawOverride(raw) || 0;
                 });
             } else {
@@ -261,7 +440,7 @@
             if (window.Injector && typeof window.Injector.apply === 'function') {
                 window.Injector.apply({ variables: payload.variables });
             } else {
-                console.warn('PaletteLive: Injector not available, skipping variable apply');
+                PLLog.warn(' Injector not available, skipping variable apply');
             }
         }
         if (payload.removeVariables) {
@@ -271,6 +450,11 @@
     }
 
     chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+        // If context is invalidated, reject all messages
+        if (_plContextInvalidated) {
+            sendResponse({ success: false, error: 'Extension context invalidated. Please refresh the page.' });
+            return false;
+        }
         try {
             // Ping to check if content script is ready
             if (request.type === 'PING') {
@@ -280,7 +464,7 @@
                     hasExtractor: typeof window.Extractor !== 'undefined',
                     hasShadowWalker: typeof window.ShadowWalker !== 'undefined',
                     hasEditorPanel: typeof window.EditorPanel !== 'undefined',
-                    paused: __plPaused
+                    paused: __plPaused,
                 });
                 return false;
             }
@@ -288,24 +472,55 @@
             // Pause extension — stop all background activity
             if (request.type === 'PAUSE_EXTENSION') {
                 __plPaused = true;
+                try {
+                    sessionStorage.setItem('__plWasActiveBeforeReload', '0');
+                } catch (e) {
+                    /* ignore */
+                }
                 stopObserver();
                 stopOverrideWatchdog();
                 clearTimeout(rebuildTimer);
                 clearTimeout(_plScrollReapplyTimer);
                 clearTimeout(_plRouteTimer);
-                console.log('PaletteLive: Extension paused on this page');
+                clearInterval(_weakRefPruneTimer);
+                _weakRefPruneTimer = null;
+                PLLog.info(' Extension paused on this page');
                 sendResponse({ success: true });
                 return;
             }
 
-            // Resume extension — restart background activity
+            // Resume extension — restart background activity and re-apply saved palette
             if (request.type === 'RESUME_EXTENSION') {
                 __plPaused = false;
+                try {
+                    sessionStorage.setItem('__plWasActiveBeforeReload', '1');
+                } catch (e) {
+                    /* ignore */
+                }
                 startObserver();
+                startWeakRefPruneTimer();
                 if (rawOverrideState.size > 0) {
                     startOverrideWatchdog();
                 }
-                console.log('PaletteLive: Extension resumed on this page');
+                // Re-apply previously saved palette data for this domain so the
+                // user's changes are active as soon as they turn the extension on.
+                const _resumeDomain = window.location.hostname;
+                if (window.StorageUtils && _resumeDomain) {
+                    window.StorageUtils.getPalette(_resumeDomain)
+                        .then((savedData) => {
+                            if (savedData && savedData.overrides) {
+                                PLLog.info(' Re-applying saved palette for', _resumeDomain);
+                                applySavedPalette(savedData);
+                            } else if (savedData && savedData.settings) {
+                                if (savedData.settings.scheme) setColorScheme(savedData.settings.scheme);
+                                if (savedData.settings.vision) setVisionMode(savedData.settings.vision);
+                            }
+                        })
+                        .catch(() => {
+                            /* ignore */
+                        });
+                }
+                PLLog.info(' Extension resumed on this page');
                 sendResponse({ success: true });
                 return;
             }
@@ -322,27 +537,52 @@
 
             if (request.type === 'EXTRACT_PALETTE') {
                 if (typeof window.Extractor === 'undefined') {
-                    console.warn('PaletteLive: Extractor not available yet');
+                    PLLog.warn(' Extractor not available yet');
                     sendResponse({ success: false, error: 'Extractor not loaded. Please try again.' });
                     return false;
                 }
                 if (typeof window.ShadowWalker === 'undefined') {
-                    console.warn('PaletteLive: ShadowWalker not available yet');
+                    PLLog.warn(' ShadowWalker not available yet');
                     sendResponse({ success: false, error: 'ShadowWalker not loaded. Please try again.' });
                     return false;
                 }
 
+                // ── Fast path: return cached scan result ──────────────
+                // If the popup is reopened on the same URL within the TTL window,
+                // skip the full DOM scan and respond instantly from memory.
+                const _nowTs = Date.now();
+                if (
+                    _scanCache &&
+                    _scanCache.url === location.href &&
+                    _nowTs - _scanCache.ts < _SCAN_CACHE_TTL_MS
+                ) {
+                    PLLog.debug('PaletteLive: EXTRACT_PALETTE served from cache');
+                    sendResponse({ success: true, data: _scanCache.data });
+                    // Ensure colorElementMap is ready for override operations
+                    // without blocking the response.
+                    if (!colorElementMap.size) setTimeout(buildColorMap, 0);
+                    return false;
+                }
+
+                // ── Slow path: full DOM scan ───────────────────────────
                 window.Extractor.scan()
-                    .then(data => {
+                    .then((data) => {
+                        // Cache the result for subsequent popup opens on this URL.
+                        _scanCache = { url: location.href, data, ts: Date.now() };
+                        // Respond to the popup immediately with the scanned colors.
+                        // buildColorMap() is a separate full DOM-walk that populates the
+                        // element-to-color index used by override operations — it does NOT
+                        // affect the color list shown in the popup, so we run it AFTER
+                        // sending the response to avoid blocking the popup UI.
+                        sendResponse({ success: true, data });
                         try {
                             buildColorMap();
                         } catch (mapError) {
-                            console.error('PaletteLive: buildColorMap error:', mapError);
+                            PLLog.error(' buildColorMap error:', mapError);
                         }
-                        sendResponse({ success: true, data });
                     })
-                    .catch(error => {
-                        console.error('PaletteLive: Extraction failed:', error);
+                    .catch((error) => {
+                        PLLog.error(' Extraction failed:', error);
                         sendResponse({ success: false, error: error.message || 'Extraction failed' });
                     });
                 return true;
@@ -387,31 +627,34 @@
                     // Reset tracking for fresh palette application
                     _textContrastFixed = new WeakSet();
                     _flushContrastCache();
-                    // Three passes — each flushes the bg cache so post-override
-                    // backgrounds are read fresh (not stale pre-override values).
+                    // Three progressive passes discover elements whose effective
+                    // backgrounds change as CSS transitions and deferred paints settle.
+                    // The bgCache was already flushed by _flushContrastCache() above;
+                    // subsequent passes reuse the cache so ancestor walks are O(1).
                     // Pass 1 (150ms): after inline styles settle
-                    // Pass 2 (500ms): after CSS transitions complete
-                    // Pass 3 (idle):  after page fully idle
+                    // Pass 2 (500ms): after CSS transitions complete — flush
+                    //                 to pick up transition-induced bg changes
+                    // Pass 3 (idle):  after page fully idle — final sweep
                     setTimeout(() => {
-                        _bgCache = new WeakMap();
                         enforceTextContrast(payload.paletteHexes);
                     }, 150);
                     setTimeout(() => {
                         if (_lastPaletteHexes === payload.paletteHexes) {
-                            _bgCache = new WeakMap();
+                            _flushContrastCache(); // pick up transition-induced bg changes
                             enforceTextContrast(payload.paletteHexes);
                         }
                     }, 500);
                     // Idle pass — fires when the browser has no urgent work
-                    const idleCb = typeof requestIdleCallback === 'function'
-                        ? requestIdleCallback
-                        : (fn) => setTimeout(fn, 2000);
-                    idleCb(() => {
-                        if (_lastPaletteHexes === payload.paletteHexes) {
-                            _bgCache = new WeakMap();
-                            enforceTextContrast(payload.paletteHexes);
-                        }
-                    }, { timeout: 3000 });
+                    const idleCb =
+                        typeof requestIdleCallback === 'function' ? requestIdleCallback : (fn) => setTimeout(fn, 2000);
+                    idleCb(
+                        () => {
+                            if (_lastPaletteHexes === payload.paletteHexes) {
+                                enforceTextContrast(payload.paletteHexes);
+                            }
+                        },
+                        { timeout: 3000 }
+                    );
                 }
 
                 sendResponse({ success: true, appliedCount });
@@ -445,13 +688,21 @@
                                     }
                                 }
                                 appliedCount++;
-                            } catch (e) { /* ignore */ }
+                            } catch (e) {
+                                /* ignore */
+                            }
                         });
                     }
                     // Update state so watchdog doesn't revert
                     rawOverrideState.set(originalHex, currentHex);
 
-                    // Also update variable if provided
+                    // Fast update the fallback CSS variable (instant for elements using fallback classes)
+                    const safeId = getSafeId(data.original);
+                    if (safeId) {
+                        document.documentElement.style.setProperty(`--pl-override-${safeId}`, currentHex, 'important');
+                    }
+
+                    // Also update Theme variable if provided
                     if (data.variableName) {
                         document.documentElement.style.setProperty(data.variableName, currentHex, 'important');
                     }
@@ -482,6 +733,8 @@
                 const preserveScheme = !!(request.payload && request.payload.preserveScheme);
                 const preserveVision = !!(request.payload && request.payload.preserveVision);
                 isRescanning = true;
+                // Always bypass cache — user explicitly requested a fresh scan.
+                _scanCache = null;
                 resetAllOverrides({ preserveScheme, preserveVision });
 
                 if (typeof window.Extractor === 'undefined') {
@@ -493,17 +746,21 @@
 
                 waitForStyleSettle()
                     .then(() => window.Extractor.scan())
-                    .then(data => {
-                        try {
-                            buildColorMap();
-                        } catch (mapError) {
-                            console.error('PaletteLive: buildColorMap error:', mapError);
-                        }
+                    .then((data) => {
+                        // Cache fresh result for next popup open.
+                        _scanCache = { url: location.href, data, ts: Date.now() };
+                        // Respond immediately — buildColorMap() is post-processing that
+                        // does not affect the color list sent to the popup.
                         isRescanning = false;
                         flushPendingOverrides();
                         sendResponse({ success: true, data });
+                        try {
+                            buildColorMap();
+                        } catch (mapError) {
+                            PLLog.error(' buildColorMap error:', mapError);
+                        }
                     })
-                    .catch(error => {
+                    .catch((error) => {
                         isRescanning = false;
                         flushPendingOverrides();
                         sendResponse({ success: false, error: error.message || 'Reset+rescan failed' });
@@ -519,29 +776,39 @@
                 }
 
                 isRescanning = true;
+                // Always bypass cache — user explicitly clicked Rescan.
+                _scanCache = null;
                 // Suspend watchdog & scroll reapply during heavy rescan work
                 stopOverrideWatchdog();
                 clearTimeout(_plScrollReapplyTimer);
 
                 waitForStyleSettle()
                     .then(() => window.Extractor.scan())
-                    .then(data => {
-                        try {
-                            // buildColorMap() already calls reapplyAllOverrides() internally,
-                            // which handles inline style re-application for all mapped elements.
-                            buildColorMap();
-                            // Refresh fallback CSS rules in one batch — NO per-override DOM walk.
-                            batchRefreshFallbackCSS();
-                        } catch (mapError) {
-                            console.error('PaletteLive: buildColorMap/fallback error:', mapError);
-                        }
+                    .then((data) => {
+                        // Cache fresh result for next popup open.
+                        _scanCache = { url: location.href, data, ts: Date.now() };
+                        // Respond immediately with the scan data so the popup is never
+                        // blocked by the heavy post-scan DOM work below (buildColorMap
+                        // calls reapplyAllOverrides on all mapped elements, which calls
+                        // getComputedStyle per element and can take several seconds when
+                        // overrides are active — easily exceeding the 20s message timeout).
                         isRescanning = false;
                         flushPendingOverrides();
-                        // Restart background monitors
+                        // Restart background monitors before responding so watchdog is
+                        // active before the popup processes the result.
                         if (rawOverrideState.size > 0) startOverrideWatchdog();
                         sendResponse({ success: true, data });
+                        // Post-processing runs after the channel closes — no timeout risk.
+                        try {
+                            // buildColorMap() already calls reapplyAllOverrides() internally.
+                            buildColorMap();
+                            // Refresh fallback CSS rules in one batch.
+                            batchRefreshFallbackCSS();
+                        } catch (mapError) {
+                            PLLog.error(' buildColorMap/fallback error:', mapError);
+                        }
                     })
-                    .catch(error => {
+                    .catch((error) => {
                         isRescanning = false;
                         flushPendingOverrides();
                         if (rawOverrideState.size > 0) startOverrideWatchdog();
@@ -576,14 +843,16 @@
                                             }
                                         }
                                         applied++;
-                                    } catch (e) { /* ignore */ }
+                                    } catch (e) {
+                                        /* ignore */
+                                    }
                                 });
                             }
                         });
                         // Refresh all fallback CSS rules in one batch — NO per-override DOM walk
                         batchRefreshFallbackCSS();
                     });
-                    console.log(`PaletteLive: Force-reapplied ${applied} element-properties + fallback CSS`);
+                    PLLog.info(`Force-reapplied ${applied} element-properties + fallback CSS`);
                     sendResponse({ success: true, applied });
                 } catch (error) {
                     sendResponse({ success: false, error: error.message });
@@ -625,6 +894,21 @@
                 return;
             }
 
+            if (request.type === 'FIX_TEXT_CONTRAST') {
+                // Re-run full-page text contrast enforcement (async chunked)
+                const paletteHexes = (request.payload && request.payload.paletteHexes) || _lastPaletteHexes || [];
+                _flushContrastCache();
+                _textContrastFixed = new WeakSet();
+                if (!document.body) {
+                    sendResponse({ success: true, fixed: 0 });
+                    return false;
+                }
+                enforceTextContrast(paletteHexes, null, (fixedCount) => {
+                    sendResponse({ success: true, fixed: fixedCount });
+                });
+                return true; // keep sendResponse alive (async)
+            }
+
             if (request.type === 'SET_VISION_MODE') {
                 const mode = request.payload && request.payload.mode;
                 const appliedMode = setVisionMode(mode);
@@ -639,15 +923,19 @@
             }
 
             if (request.type === 'WAIT_FOR_PAINT') {
-                // Use double requestAnimationFrame + a small timeout to guarantee
+                // Use triple requestAnimationFrame + a longer timeout to guarantee
                 // the browser has fully composited and painted the current state.
-                // This is critical for comparison: after removing overrides, we need
-                // the visual frame to update before capturing a screenshot.
+                // This is critical for comparison: after removing/re-applying many
+                // overrides the browser needs more time for layout + paint to settle.
+                // 200 ms covers even heavy pages where Injector CSS + inline style
+                // changes across many elements cause multiple layout passes.
                 requestAnimationFrame(() => {
                     requestAnimationFrame(() => {
-                        setTimeout(() => {
-                            sendResponse({ success: true });
-                        }, 50);
+                        requestAnimationFrame(() => {
+                            setTimeout(() => {
+                                sendResponse({ success: true });
+                            }, 200);
+                        });
                     });
                 });
                 return true; // keep sendResponse alive (async)
@@ -676,145 +964,211 @@
                     sendResponse({ success: false, error: 'Dropper not loaded' });
                     return;
                 }
-                // Rebuild color map so dynamically loaded elements are captured
-                buildColorMap();
+                // Suspend background work (watchdog, observer debounce, scroll
+                // reapply) while the dropper is active so getComputedStyle calls
+                // from those systems don't compete with the dropper's RAF loop.
+                _plSetDropperActive(true);
                 window.Dropper.start();
+                // Respond immediately so the popup can close without delay.
                 sendResponse({ success: true });
+                // Ensure the color map is populated for later override operations.
+                // Deferred with setTimeout so it never blocks dropper startup —
+                // the dropper's _colorAtPoint uses getComputedStyle directly and
+                // does not rely on colorElementMap.
+                setTimeout(ensureColorMap, 0);
                 return;
             }
 
             if (request.type === 'CANCEL_PICK') {
                 if (window.Dropper) window.Dropper.cancel();
+                _plSetDropperActive(false);
                 sendResponse({ success: true });
                 return;
             }
         } catch (error) {
-            console.error('PaletteLive error:', error);
+            PLLog.error('', error);
             sendResponse({ success: false, error: error.message });
         }
     });
 
+    // ── Dropper-active flag ───────────────────────────────────────
+    // While the dropper is running, suspend all background work
+    // (watchdog, MutationObserver callbacks, scroll reapply) so they
+    // don't compete with the dropper's per-frame getComputedStyle calls.
+    let _plDropperActive = false;
+    let _plDropperResumeTimer = null;
+
+    function _plSetDropperActive(active) {
+        _plDropperActive = active;
+        clearTimeout(_plDropperResumeTimer);
+        if (active) {
+            // Safety net: always resume after 30s even if dropper never finishes cleanly
+            _plDropperResumeTimer = setTimeout(() => {
+                _plDropperActive = false;
+                if (rawOverrideState.size > 0) startOverrideWatchdog();
+            }, 30000);
+        } else {
+            // Resume watchdog if we have active overrides
+            if (rawOverrideState.size > 0) startOverrideWatchdog();
+        }
+    }
+
+    // Listen for secure dropper-active events (validated by secret token)
+    window.addEventListener('pl-dropper-active', (event) => {
+        if (!isValidDropperEvent(event)) return;
+        const active = !!(event.detail && event.detail.active);
+        _plSetDropperActive(active);
+    });
+
+    // Shared CSS property list for DOM color scanning — used by both
+    // buildColorMap and processAddedSubtree to avoid duplicating the array.
+    const _COLOR_SCAN_PROPS = Object.freeze([
+        { js: 'backgroundColor', css: 'background-color' },
+        { js: 'color', css: 'color' },
+        { js: 'borderTopColor', css: 'border-top-color' },
+        { js: 'borderRightColor', css: 'border-right-color' },
+        { js: 'borderBottomColor', css: 'border-bottom-color' },
+        { js: 'borderLeftColor', css: 'border-left-color' },
+        { js: 'outlineColor', css: 'outline-color' },
+        { js: 'textDecorationColor', css: 'text-decoration-color' },
+        { js: 'caretColor', css: 'caret-color' },
+        { js: 'columnRuleColor', css: 'column-rule-color' },
+        { js: 'fill', css: 'fill' },
+        { js: 'stroke', css: 'stroke' },
+    ]);
+    const _ACCENT_PROP = Object.freeze({ js: 'accentColor', css: 'accent-color' });
+
+    // Concurrency guard — prevents overlapping buildColorMap calls from
+    // scroll, observer, and watchdog producing inconsistent state.
+    let _isBuildingColorMap = false;
+
     function buildColorMap() {
-        colorElementMap.clear();
-        if (!document.body) return;
+        if (_isBuildingColorMap) {
+            PLLog.debug('PaletteLive: buildColorMap already in progress, skipping');
+            return;
+        }
+        _isBuildingColorMap = true;
+        try {
+            colorElementMap.clear();
+            if (!document.body) return;
 
-        const props = [
-            { js: 'backgroundColor', css: 'background-color' },
-            { js: 'color', css: 'color' },
-            { js: 'borderTopColor', css: 'border-top-color' },
-            { js: 'borderRightColor', css: 'border-right-color' },
-            { js: 'borderBottomColor', css: 'border-bottom-color' },
-            { js: 'borderLeftColor', css: 'border-left-color' },
-            { js: 'outlineColor', css: 'outline-color' },
-            { js: 'textDecorationColor', css: 'text-decoration-color' },
-            { js: 'caretColor', css: 'caret-color' },
-            { js: 'columnRuleColor', css: 'column-rule-color' },
-            { js: 'fill', css: 'fill' },
-            { js: 'stroke', css: 'stroke' }
-        ];
-        const accentProp = { js: 'accentColor', css: 'accent-color' };
+            const props = _COLOR_SCAN_PROPS;
+            const accentProp = _ACCENT_PROP;
 
-        // Also scan document.documentElement (<html>) because many pages set
-        // their primary background color on <html>, and ShadowWalker starts
-        // from document.body, which misses it.
-        const scanDocumentElement = (addToMapFn) => {
-            if (!document.documentElement) return;
-            try {
-                const style = window.getComputedStyle(document.documentElement);
-                props.forEach(({ js, css }) => addToMapFn(style[js], css, document.documentElement));
+            // Also scan document.documentElement (<html>) because many pages set
+            // their primary background color on <html>, and ShadowWalker starts
+            // from document.body, which misses it.
+            const scanDocumentElement = (addToMapFn) => {
+                if (!document.documentElement) return;
                 try {
-                    addToMapFn(style[accentProp.js], accentProp.css, document.documentElement);
-                } catch (e) { /* ignore */ }
-            } catch (e) { /* ignore */ }
-        };
-
-        if (window.ShadowWalker && typeof window.ShadowWalker.walk === 'function') {
-            const addToMap = (value, cssPropName, el) => {
-                if (!value || window.ColorUtils.isTransparent(value)) return;
-                if (value === 'auto' || value === 'initial' || value === 'inherit' || value === 'currentcolor' || value === 'currentColor') return;
-
-                // Skip reading 'color' from elements whose text was fixed by
-                // enforceTextContrast — the computed value is the contrast-fixed
-                // color (e.g. #ffffff), NOT the original page color.  Mapping it
-                // would pollute colorElementMap with phantom associations that
-                // cause wrong overrides on subsequent reapplyAllOverrides calls.
-                if (cssPropName === 'color' && el && _textContrastFixed.has(el)) return;
-
-                const hex = window.ColorUtils.rgbToHex8(value).toLowerCase();
-                if (!hex || (hex === '#000000' && value === 'rgba(0, 0, 0, 0)')) return;
-
-                if (!colorElementMap.has(hex)) {
-                    colorElementMap.set(hex, []);
+                    const style = window.getComputedStyle(document.documentElement);
+                    props.forEach(({ js, css }) => addToMapFn(style[js], css, document.documentElement));
+                    try {
+                        addToMapFn(style[accentProp.js], accentProp.css, document.documentElement);
+                    } catch (e) {
+                        /* ignore */
+                    }
+                } catch (e) {
+                    /* ignore */
                 }
-
-                colorElementMap.get(hex).push({ element: el || document.body, cssProp: cssPropName });
             };
 
-            // Scan <html> first
-            scanDocumentElement(addToMap);
+            if (window.ShadowWalker && typeof window.ShadowWalker.walk === 'function') {
+                const addToMap = (value, cssPropName, el) => {
+                    if (!value || window.ColorUtils.isTransparent(value)) return;
+                    if (
+                        value === 'auto' ||
+                        value === 'initial' ||
+                        value === 'inherit' ||
+                        value === 'currentcolor' ||
+                        value === 'currentColor'
+                    )
+                        return;
 
-            // Cap total elements to avoid freezing on massive pages
-            let _mapElCount = 0;
-            const _MAP_EL_LIMIT = 5000;
-            window.ShadowWalker.walk(document.body, (element) => {
-                if (_mapElCount >= _MAP_EL_LIMIT) return;
-                try {
-                    // Skip invisible elements — they don't contribute visible colors
-                    // and calling getComputedStyle on them is wasted work.
-                    if (element.offsetWidth === 0 && element.offsetHeight === 0) return;
+                    // Skip reading 'color' from elements whose text was fixed by
+                    // enforceTextContrast — the computed value is the contrast-fixed
+                    // color (e.g. #ffffff), NOT the original page color.  Mapping it
+                    // would pollute colorElementMap with phantom associations that
+                    // cause wrong overrides on subsequent reapplyAllOverrides calls.
+                    if (cssPropName === 'color' && el && _textContrastFixed.has(el)) return;
 
-                    const style = window.getComputedStyle(element);
-                    if (style.display === 'none' || style.visibility === 'hidden') return;
+                    const hex = window.ColorUtils.rgbToHex8(value).toLowerCase();
+                    if (!hex || (hex === '#000000' && value === 'rgba(0, 0, 0, 0)')) return;
 
-                    const addToMapEl = (value, cssPropName) => addToMap(value, cssPropName, element);
-
-                    props.forEach(({ js, css }) => addToMapEl(style[js], css));
-                    try {
-                        addToMapEl(style[accentProp.js], accentProp.css);
-                    } catch (error) {
-                        // Ignore unsupported accent-color contexts.
+                    if (!colorElementMap.has(hex)) {
+                        colorElementMap.set(hex, []);
                     }
-                    _mapElCount++;
-                } catch (error) {
-                    // Ignore style read errors.
-                }
-            });
-        }
 
-        console.log(`PaletteLive: Mapped ${colorElementMap.size} unique colors to elements`);
+                    colorElementMap.get(hex).push({ element: el || document.body, cssProp: cssPropName });
+                };
 
-        // Cross-reference active overrides: elements currently showing an overridden
-        // currentHex need to also be mapped under their originalHex so that
-        // reapplyAllOverrides() and FORCE_REAPPLY can find them.
-        if (rawOverrideState.size > 0) {
-            rawOverrideState.forEach((currentHex, originalHex) => {
-                if (currentHex === originalHex) return;
+                // Scan <html> first
+                scanDocumentElement(addToMap);
 
-                const currentEntries = colorElementMap.get(currentHex);
-                if (!currentEntries || !currentEntries.length) return;
+                // Cap total elements to avoid freezing on massive pages
+                let _mapElCount = 0;
+                const _MAP_EL_LIMIT = PLConfig.MAP_ELEMENT_LIMIT;
+                window.ShadowWalker.walk(document.body, (element) => {
+                    if (_mapElCount >= _MAP_EL_LIMIT) return false; // stop walk
+                    try {
+                        // Skip invisible elements cheaply using only CSS properties —
+                        // NEVER use offsetWidth/offsetHeight here as they force a full
+                        // layout reflow on every element, causing page freezes on large DOMs.
+                        const style = window.getComputedStyle(element);
+                        if (style.display === 'none' || style.visibility === 'hidden') return;
 
-                if (!colorElementMap.has(originalHex)) {
-                    colorElementMap.set(originalHex, []);
-                }
+                        const addToMapEl = (value, cssPropName) => addToMap(value, cssPropName, element);
 
-                const originalEntries = colorElementMap.get(originalHex);
-                currentEntries.forEach(entry => {
-                    // Only remap elements that we actually overrode (checked via overrideMap)
-                    const propMap = overrideMap.get(entry.element);
-                    if (propMap && propMap.has(entry.cssProp)) {
-                        const alreadyMapped = originalEntries.some(
-                            e => e.element === entry.element && e.cssProp === entry.cssProp
-                        );
-                        if (!alreadyMapped) {
-                            originalEntries.push(entry);
+                        props.forEach(({ js, css }) => addToMapEl(style[js], css));
+                        try {
+                            addToMapEl(style[accentProp.js], accentProp.css);
+                        } catch (error) {
+                            // Ignore unsupported accent-color contexts.
                         }
+                        _mapElCount++;
+                    } catch (error) {
+                        // Ignore style read errors.
                     }
                 });
-            });
-        }
+            }
 
-        // Re-apply all active overrides to the freshly mapped elements
-        reapplyAllOverrides();
+            PLLog.info(`Mapped ${colorElementMap.size} unique colors to elements`);
+
+            // Cross-reference active overrides: elements currently showing an overridden
+            // currentHex need to also be mapped under their originalHex so that
+            // reapplyAllOverrides() and FORCE_REAPPLY can find them.
+            if (rawOverrideState.size > 0) {
+                rawOverrideState.forEach((currentHex, originalHex) => {
+                    if (currentHex === originalHex) return;
+
+                    const currentEntries = colorElementMap.get(currentHex);
+                    if (!currentEntries || !currentEntries.length) return;
+
+                    if (!colorElementMap.has(originalHex)) {
+                        colorElementMap.set(originalHex, []);
+                    }
+
+                    const originalEntries = colorElementMap.get(originalHex);
+                    currentEntries.forEach((entry) => {
+                        // Only remap elements that we actually overrode (checked via overrideMap)
+                        const propMap = overrideMap.get(entry.element);
+                        if (propMap && propMap.has(entry.cssProp)) {
+                            const alreadyMapped = originalEntries.some(
+                                (e) => e.element === entry.element && e.cssProp === entry.cssProp
+                            );
+                            if (!alreadyMapped) {
+                                originalEntries.push(entry);
+                            }
+                        }
+                    });
+                });
+            }
+
+            // Re-apply all active overrides to the freshly mapped elements
+            reapplyAllOverrides();
+        } finally {
+            _isBuildingColorMap = false;
+        }
     }
 
     /**
@@ -835,14 +1189,15 @@
                 entries.forEach(({ element, cssProp }) => {
                     try {
                         if (!element.isConnected) return;
-                        // Skip invisible elements — no need to reapply overrides
-                        if (element.offsetWidth === 0 && element.offsetHeight === 0) return;
 
                         // Don't overwrite text color on elements fixed by enforceTextContrast
                         if (cssProp === 'color' && _textContrastFixed.has(element)) return;
 
-                        // Cache getComputedStyle — avoids calling it twice per element
+                        // Read computed style once and use CSS-only visibility check —
+                        // NEVER use offsetWidth/offsetHeight as they force a full layout
+                        // reflow per element, causing freezes/timeouts on large pages.
                         const style = window.getComputedStyle(element);
+                        if (style.display === 'none' || style.visibility === 'hidden') return;
                         const jsName = cssPropToJs(cssProp);
                         const computedValue = style[jsName];
                         if (computedValue) {
@@ -864,7 +1219,9 @@
                                     _scheduleDeferredContrast();
                                     return;
                                 }
-                            } catch (e) { /* ignore — proceed with reapply */ }
+                            } catch (e) {
+                                /* ignore — proceed with reapply */
+                            }
                         }
 
                         captureInlineSnapshot(element, cssProp);
@@ -887,7 +1244,7 @@
             });
 
             if (applied > 0) {
-                console.log(`PaletteLive: Re-applied overrides to ${applied} element-properties`);
+                PLLog.info(`Re-applied overrides to ${applied} element-properties`);
             }
             // Re-run text contrast enforcement after reapply — but debounced
             // to avoid cascading DOM walks.
@@ -948,7 +1305,7 @@
             propMap.set(cssProp, {
                 hadInline: value !== '' || priority !== '',
                 value,
-                priority
+                priority,
             });
         }
 
@@ -977,7 +1334,7 @@
             window.Injector.reset();
         }
 
-        overrideRefs.forEach(ref => {
+        overrideRefs.forEach((ref) => {
             const element = ref.deref();
             if (!element) return;
 
@@ -1000,7 +1357,7 @@
             if (window.ShadowWalker && typeof window.ShadowWalker.walk === 'function') {
                 window.ShadowWalker.walk(document.body, (element) => {
                     if (!element.classList || !element.classList.length) return;
-                    addedFallbackClasses.forEach(cls => {
+                    addedFallbackClasses.forEach((cls) => {
                         element.classList.remove(cls);
                     });
                 });
@@ -1032,7 +1389,7 @@
             startObserver();
         }
 
-        console.log('PaletteLive: All overrides reset');
+        PLLog.info(' All overrides reset');
     }
 
     function getSafeId(value) {
@@ -1050,7 +1407,7 @@
             outlineColor: `pl-outline-${safeId}`,
             textDecorationColor: `pl-decoration-${safeId}`,
             fill: `pl-fill-${safeId}`,
-            stroke: `pl-stroke-${safeId}`
+            stroke: `pl-stroke-${safeId}`,
         };
     }
 
@@ -1061,17 +1418,17 @@
         if (document.body && window.ShadowWalker && typeof window.ShadowWalker.walk === 'function') {
             window.ShadowWalker.walk(document.body, (element) => {
                 if (!element.classList || !element.classList.length) return;
-                classNames.forEach(className => {
+                classNames.forEach((className) => {
                     element.classList.remove(className);
                 });
             });
         }
 
-        classNames.forEach(className => addedFallbackClasses.delete(className));
+        classNames.forEach((className) => addedFallbackClasses.delete(className));
 
         if (window.Injector && window.Injector.state && window.Injector.state.selectors) {
             let changed = false;
-            classNames.forEach(className => {
+            classNames.forEach((className) => {
                 const selector = `.${className}`;
                 if (Object.prototype.hasOwnProperty.call(window.Injector.state.selectors, selector)) {
                     delete window.Injector.state.selectors[selector];
@@ -1140,51 +1497,30 @@
                 // Try to find similar colors in the map
                 const similarKeys = [];
                 for (const key of colorElementMap.keys()) {
-                    if (window.ColorUtils.areSimilar(key, originalHex, 10)) { // Tolerance of 10
+                    if (window.ColorUtils.areSimilar(key, originalHex, 10)) {
+                        // Tolerance of 10
                         similarKeys.push(key);
                     }
                 }
 
                 if (similarKeys.length > 0) {
                     entries = [];
-                    similarKeys.forEach(key => {
+                    similarKeys.forEach((key) => {
                         const keyEntries = colorElementMap.get(key);
                         if (keyEntries) entries.push(...keyEntries);
                     });
-                    console.log(`PaletteLive: Fuzzy matched ${similarKeys.length} colors for ${originalHex}`);
+                    PLLog.debug(`Fuzzy matched ${similarKeys.length} colors for ${originalHex}`);
                 }
             }
 
-            // Debug logging and fallback rebuild
+            // Debug logging — color simply isn't present on the page (common on
+            // dynamic pages like YouTube where saved colors may reference elements
+            // that no longer exist).  The fallback CSS path below will still cover
+            // any future elements that appear with this color.
             if (!entries || !entries.length) {
-                console.warn(`PaletteLive: No elements found in color map for ${originalHex} (even with fuzzy match). Map has ${colorElementMap.size} colors.`);
-
-                // Try to rebuild the color map in case the DOM has changed
-                console.log('PaletteLive: Rebuilding color map and retrying...');
-
-                buildColorMap();
-                entries = colorElementMap.get(originalHex);
-
-                // Retry fuzzy match after rebuild
-                if (!entries || !entries.length) {
-                    const similarKeys = [];
-                    for (const key of colorElementMap.keys()) {
-                        if (window.ColorUtils.areSimilar(key, originalHex, 10)) {
-                            similarKeys.push(key);
-                        }
-                    }
-                    if (similarKeys.length > 0) {
-                        entries = [];
-                        similarKeys.forEach(key => {
-                            const keyEntries = colorElementMap.get(key);
-                            if (keyEntries) entries.push(...keyEntries);
-                        });
-                    }
-                }
-
-                if (entries && entries.length) {
-                    console.log(`PaletteLive: Found ${entries.length} elements after rebuild`);
-                }
+                PLLog.debug(
+                    `PaletteLive: No elements found in color map for ${originalHex} (even with fuzzy match). Map has ${colorElementMap.size} colors.`
+                );
             }
 
             if (entries && entries.length) {
@@ -1236,7 +1572,10 @@
                             el.style.removeProperty('background-color');
                         }
                         el.style.setProperty('background-color', currentHex, 'important');
-                        const elBgImg = window.getComputedStyle(el).backgroundImage;
+                        // Reuse the cached computed style — backgroundImage is
+                        // independent of background-color and the live
+                        // CSSStyleDeclaration auto-reflects any changes.
+                        const elBgImg = cs.backgroundImage;
                         // Only clear gradients; skip 'none' (allows lazy-loaded images later) and url() (preserves images)
                         if (elBgImg && elBgImg !== 'none' && !elBgImg.includes('url(')) {
                             el.style.setProperty('background-image', 'none', 'important');
@@ -1247,13 +1586,17 @@
                             colorElementMap.set(originalHex, []);
                         }
                         // Avoid duplicates
-                        const alreadyInMap = colorElementMap.get(originalHex).some(e => e.element === el && e.cssProp === 'background-color');
+                        const alreadyInMap = colorElementMap
+                            .get(originalHex)
+                            .some((e) => e.element === el && e.cssProp === 'background-color');
                         if (!alreadyInMap) {
                             colorElementMap.get(originalHex).push({ element: el, cssProp: 'background-color' });
                         }
                         appliedCount++;
                     }
-                } catch (e) { /* ignore */ }
+                } catch (e) {
+                    /* ignore */
+                }
             }
 
             rawOverrideState.set(originalHex, currentHex);
@@ -1267,18 +1610,18 @@
             batchRefreshFallbackCSS();
 
             if (appliedCount > 0) {
-                console.log(`PaletteLive: Applied ${currentHex} to ${appliedCount} element-properties for ${originalHex}`);
+                PLLog.info(`Applied ${currentHex} to ${appliedCount} element-properties for ${originalHex}`);
                 result = appliedCount;
             } else {
                 // If no elements were found, the fallback CSS (applied above) is our only hope
-                console.warn(`PaletteLive: No inline overrides applied for ${originalHex}, relying on fallback CSS`);
+                PLLog.debug(`PaletteLive: No inline overrides applied for ${originalHex}, relying on fallback CSS`);
                 result = 0;
             }
         });
         return result;
     }
 
-    function applyRawOverrideFallback(data) {
+    function _applyRawOverrideFallback(data) {
         const safeId = getSafeId(data.original);
         const classMap = getFallbackClassMap(safeId);
         const currentHex = window.ColorUtils.rgbToHex8(data.current).toLowerCase();
@@ -1288,13 +1631,14 @@
             if (document.body && window.ShadowWalker && typeof window.ShadowWalker.walk === 'function') {
                 window.ShadowWalker.walk(document.body, (element) => {
                     try {
-                        // Skip invisible elements — no need to apply fallback classes
-                        if (element.offsetWidth === 0 && element.offsetHeight === 0) return;
-
+                        // CSS-only visibility check — NEVER use offsetWidth/offsetHeight
+                        // as they force a full layout reflow per element.
                         const style = window.getComputedStyle(element);
                         if (style.display === 'none' || style.visibility === 'hidden') return;
 
-                        const hasClass = Object.values(classMap).some(className => element.classList.contains(className));
+                        const hasClass = Object.values(classMap).some((className) =>
+                            element.classList.contains(className)
+                        );
                         if (hasClass) return;
 
                         if (checkMatch(style.backgroundColor, data.original)) {
@@ -1380,7 +1724,7 @@
             }
 
             if (matchedCount > 0) {
-                console.log(`PaletteLive: Fallback applied ${currentHex} to ${matchedCount} elements for ${data.original}`);
+                PLLog.info(`Fallback applied ${currentHex} to ${matchedCount} elements for ${data.original}`);
             }
         });
         return matchedCount;
@@ -1399,7 +1743,7 @@
         if (!_lastPaletteHexes || !_lastPaletteHexes.length) return;
         const MIN_CR = 4.5;
         const bwHexes = ['#ffffff', '#000000'];
-        const palette = _lastPaletteHexes.map(h => {
+        const palette = _lastPaletteHexes.map((h) => {
             let hex = h.toLowerCase();
             if (hex.length === 9 && hex.endsWith('ff')) hex = hex.substring(0, 7);
             return hex;
@@ -1411,7 +1755,8 @@
                 let hasText = false;
                 for (let i = 0; i < el.childNodes.length; i++) {
                     if (el.childNodes[i].nodeType === Node.TEXT_NODE && el.childNodes[i].textContent.trim()) {
-                        hasText = true; break;
+                        hasText = true;
+                        break;
                     }
                 }
                 if (!hasText && !(el.textContent && el.textContent.trim())) return;
@@ -1426,15 +1771,22 @@
                 if (currentCR >= MIN_CR) return; // already readable
 
                 // Find best replacement: palette color first, then black/white
-                let bestHex = null, bestCR = 0;
+                let bestHex = null,
+                    bestCR = 0;
                 for (const c of palette) {
                     const cr = _contrastRatio(c, newBgHex);
-                    if (cr >= MIN_CR && cr > bestCR) { bestCR = cr; bestHex = c; }
+                    if (cr >= MIN_CR && cr > bestCR) {
+                        bestCR = cr;
+                        bestHex = c;
+                    }
                 }
                 if (!bestHex) {
                     for (const c of bwHexes) {
                         const cr = _contrastRatio(c, newBgHex);
-                        if (cr > bestCR) { bestCR = cr; bestHex = c; }
+                        if (cr > bestCR) {
+                            bestCR = cr;
+                            bestHex = c;
+                        }
                     }
                 }
                 if (bestHex && bestCR > currentCR) {
@@ -1442,7 +1794,9 @@
                     // Track this fix so reapplyAllOverrides / watchdog won't undo it
                     _textContrastFixed.add(el);
                 }
-            } catch (e) { /* ignore */ }
+            } catch (e) {
+                /* ignore */
+            }
         };
 
         // Fix the parent itself if it has text
@@ -1452,7 +1806,9 @@
             const children = Array.from(parentEl.children);
             const limit = Math.min(children.length, 50); // cap for perf
             for (let i = 0; i < limit; i++) fixEl(children[i]);
-        } catch (e) { /* ignore */ }
+        } catch (e) {
+            /* ignore */
+        }
     }
 
     // ════════════════════════════════════════════════
@@ -1491,7 +1847,7 @@
         clearTimeout(_plBulkApplyCooldownTimer);
         _plBulkApplyCooldownTimer = setTimeout(() => {
             _plBulkApplyCooldown = false;
-        }, ms || 2000);
+        }, ms || PLConfig.BULK_APPLY_COOLDOWN_MS);
     }
 
     function applyBulkRawOverrides(overridesArray) {
@@ -1499,7 +1855,7 @@
         let totalApplied = 0;
 
         // Suppress cascading reprocessing for 2s after bulk apply
-        startBulkApplyCooldown(2000);
+        startBulkApplyCooldown(PLConfig.BULK_APPLY_COOLDOWN_MS);
 
         performDOMChange(() => {
             ensureColorMap();
@@ -1557,7 +1913,9 @@
                             }
                             handledElements.add(element);
                             totalApplied++;
-                        } catch (e) { /* ignore */ }
+                        } catch (e) {
+                            /* ignore */
+                        }
                     });
                 }
                 rawOverrideState.set(entry.originalHex, entry.currentHex);
@@ -1585,7 +1943,7 @@
                 { js: 'outlineColor', key: 'outlineColor' },
                 { js: 'textDecorationColor', key: 'textDecorationColor' },
                 { js: 'fill', key: 'fill' },
-                { js: 'stroke', key: 'stroke' }
+                { js: 'stroke', key: 'stroke' },
             ];
 
             // Walk only if Phase 2 didn't handle many elements (< 80% of expected).
@@ -1597,16 +1955,20 @@
             }, 0);
             const needsFallbackWalk = totalApplied < expectedCoverage * 0.5 || expectedCoverage === 0;
 
-            if (needsFallbackWalk && document.body && window.ShadowWalker && typeof window.ShadowWalker.walk === 'function') {
+            if (
+                needsFallbackWalk &&
+                document.body &&
+                window.ShadowWalker &&
+                typeof window.ShadowWalker.walk === 'function'
+            ) {
                 let _fbCount = 0;
-                const _FB_LIMIT = 3000; // cap fallback walk to prevent freezes
+                const _FB_LIMIT = PLConfig.FALLBACK_WALK_LIMIT; // cap fallback walk to prevent freezes
                 window.ShadowWalker.walk(document.body, (element) => {
                     if (_fbCount >= _FB_LIMIT) return;
                     if (handledElements.has(element)) return; // skip already-handled
                     try {
-                        // Skip invisible elements
-                        if (element.offsetWidth === 0 && element.offsetHeight === 0) return;
-
+                        // CSS-only visibility check — do NOT use offsetWidth/offsetHeight
+                        // as those force layout reflow on every element.
                         const style = window.getComputedStyle(element);
                         if (style.display === 'none' || style.visibility === 'hidden') return;
 
@@ -1633,7 +1995,9 @@
                             }
                         }
                         _fbCount++;
-                    } catch (e) { /* ignore */ }
+                    } catch (e) {
+                        /* ignore */
+                    }
                 });
             }
 
@@ -1659,7 +2023,7 @@
             }
 
             startOverrideWatchdog();
-            console.log(`PaletteLive: Bulk applied ${overrideEntries.length} overrides, ${totalApplied} inline changes`);
+            PLLog.info(`Bulk applied ${overrideEntries.length} overrides, ${totalApplied} inline changes`);
         });
 
         return totalApplied;
@@ -1675,7 +2039,7 @@
 
     /** WCAG relative luminance for an {r,g,b} object (0..255) → 0..1 */
     function _relLum(rgb) {
-        const s = [rgb.r, rgb.g, rgb.b].map(c => {
+        const s = [rgb.r, rgb.g, rgb.b].map((c) => {
             c = c / 255;
             return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
         });
@@ -1685,8 +2049,9 @@
     // ── Contrast-ratio LUT cache ──────────────────────────────────
     // Memoize relative-luminance and contrast-ratio computations so that
     // the thousands of identical calls during a DOM walk become O(1) lookups.
-    const _lumCache = new Map();   // hex → luminance (0..1)
-    const _crCache = new Map();   // "hex1|hex2" → ratio (1..21)
+    const _lumCache = new Map(); // hex → luminance (0..1)
+    const _crCache = new Map(); // "hex1|hex2" → ratio (1..21)
+    const _CONTRAST_CACHE_MAX = 2000; // Max entries before eviction
 
     // Per-element effective-background cache — avoids re-walking ancestor
     // chains on repeated enforceTextContrast passes within the same palette
@@ -1698,6 +2063,15 @@
     function _cachedLum(hex) {
         let v = _lumCache.get(hex);
         if (v !== undefined) return v;
+        if (_lumCache.size >= _CONTRAST_CACHE_MAX) {
+            // Evict the oldest half so hot entries survive the trim
+            const _evictCount = Math.ceil(_lumCache.size / 2);
+            let _n = 0;
+            for (const k of _lumCache.keys()) {
+                if (_n++ >= _evictCount) break;
+                _lumCache.delete(k);
+            }
+        }
         const rgb = window.ColorUtils.hexToRgb(hex);
         v = rgb ? _relLum(rgb) : 0;
         _lumCache.set(hex, v);
@@ -1709,6 +2083,15 @@
         const key = hex1 < hex2 ? hex1 + '|' + hex2 : hex2 + '|' + hex1;
         let v = _crCache.get(key);
         if (v !== undefined) return v;
+        if (_crCache.size >= _CONTRAST_CACHE_MAX) {
+            // Evict the oldest half so hot entries survive the trim
+            const _evictCount = Math.ceil(_crCache.size / 2);
+            let _n = 0;
+            for (const k of _crCache.keys()) {
+                if (_n++ >= _evictCount) break;
+                _crCache.delete(k);
+            }
+        }
         const l1 = _cachedLum(hex1);
         const l2 = _cachedLum(hex2);
         const lighter = Math.max(l1, l2);
@@ -1735,7 +2118,7 @@
         return {
             r: Math.round(fgRgba.r * a + bgRgb.r * (1 - a)),
             g: Math.round(fgRgba.g * a + bgRgb.g * (1 - a)),
-            b: Math.round(fgRgba.b * a + bgRgb.b * (1 - a))
+            b: Math.round(fgRgba.b * a + bgRgb.b * (1 - a)),
         };
     }
 
@@ -1766,15 +2149,18 @@
             try {
                 const bg = window.getComputedStyle(current).backgroundColor;
                 if (bg && bg !== 'transparent' && bg !== 'rgba(0, 0, 0, 0)') {
-                    const rgba = window.ColorUtils.hexToRgb(
-                        window.ColorUtils.rgbToHex8(bg)
-                    );
+                    const rgba = window.ColorUtils.hexToRgb(window.ColorUtils.rgbToHex8(bg));
                     if (rgba && rgba.a > 0) {
                         layers.push(rgba);
-                        if (rgba.a >= 1) { hitOpaque = true; break; }
+                        if (rgba.a >= 1) {
+                            hitOpaque = true;
+                            break;
+                        }
                     }
                 }
-            } catch (e) { /* ignore */ }
+            } catch (e) {
+                /* ignore */
+            }
             current = current.parentElement;
             depth++;
         }
@@ -1790,10 +2176,15 @@
                         const rgba = window.ColorUtils.hexToRgb(window.ColorUtils.rgbToHex8(bg));
                         if (rgba && rgba.a > 0) {
                             layers.push(rgba);
-                            if (rgba.a >= 1) { hitOpaque = true; break; }
+                            if (rgba.a >= 1) {
+                                hitOpaque = true;
+                                break;
+                            }
                         }
                     }
-                } catch (e) { /* ignore */ }
+                } catch (e) {
+                    /* ignore */
+                }
             }
         }
 
@@ -1815,7 +2206,7 @@
         }
 
         // Convert to hex, cache and return
-        const toHex2 = n => Math.min(255, Math.max(0, n)).toString(16).padStart(2, '0');
+        const toHex2 = (n) => Math.min(255, Math.max(0, n)).toString(16).padStart(2, '0');
         const _bgResult = '#' + toHex2(composite.r) + toHex2(composite.g) + toHex2(composite.b);
         _bgCache.set(el, _bgResult);
         return _bgResult;
@@ -1827,25 +2218,96 @@
      *
      * @param {string[]} paletteHexes — imported palette colors to choose from
      */
-    function enforceTextContrast(paletteHexes, subtreeRoot) {
+    function enforceTextContrast(paletteHexes, subtreeRoot, onComplete) {
         if (!document.body) return 0;
-        const MIN_CR = 4.5; // WCAG AA normal text
-        const MIN_CR_LARGE = 3.0; // WCAG AA large text (≥18px bold or ≥24px)
 
-        // Build candidate pool: palette colors + pure white & black
+        // ═══════════════════════════════════════════════════════════════
+        //  DEEP TEXT CONTRAST — ensures 100% text visibility
+        //  Uses WCAG AAA as primary target (7:1 normal, 4.5:1 large),
+        //  falls back to WCAG AA (4.5:1 / 3.0:1), and as an absolute
+        //  minimum guarantees ≥ 3:1 on every text element.
+        //  Only modifies the `color` CSS property — never touches
+        //  backgrounds, borders, or any other style.
+        // ═══════════════════════════════════════════════════════════════
+        const TARGET_CR = 7.0; // WCAG AAA normal text (ideal)
+        const TARGET_CR_LG = 4.5; // WCAG AAA large text (ideal)
+        const MIN_CR = 4.5; // WCAG AA normal text (minimum acceptable)
+        const MIN_CR_LARGE = 3.0; // WCAG AA large text (minimum acceptable)
+        const ABSOLUTE_MIN = 3.0; // Hard floor — never leave text below this
+
+        // ── Build candidate pool ──────────────────────────────────────
         const bwHexes = ['#ffffff', '#000000'];
+        const grayRamp = [
+            '#111111',
+            '#222222',
+            '#333333',
+            '#444444',
+            '#555555',
+            '#666666',
+            '#777777',
+            '#888888',
+            '#999999',
+            '#aaaaaa',
+            '#bbbbbb',
+            '#cccccc',
+            '#dddddd',
+            '#eeeeee',
+        ];
         const paletteSet = new Set();
         if (paletteHexes && paletteHexes.length) {
-            paletteHexes.forEach(h => {
+            paletteHexes.forEach((h) => {
                 let hex = h.toLowerCase();
                 if (hex.length === 9 && hex.endsWith('ff')) hex = hex.substring(0, 7);
                 paletteSet.add(hex);
             });
         }
-        // Remove b/w duplicates from palette set so we can distinguish them
-        bwHexes.forEach(h => paletteSet.delete(h));
-        const paletteCandidates = [...paletteSet]; // user's palette colors only
-        const allCandidates = [...paletteCandidates, ...bwHexes]; // palette first, b/w last
+        bwHexes.forEach((h) => paletteSet.delete(h));
+        const paletteCandidates = [...paletteSet];
+
+        // Generate tinted variants of each palette color at different
+        // lightness levels to give the algorithm more options that
+        // preserve the palette's hue character.
+        const tintedCandidates = [];
+        for (const hex of paletteCandidates) {
+            const rgb = window.ColorUtils.hexToRgb(hex);
+            if (!rgb) continue;
+            // Extract approximate HSL
+            const r = rgb.r / 255,
+                g = rgb.g / 255,
+                b = rgb.b / 255;
+            const max = Math.max(r, g, b),
+                min = Math.min(r, g, b);
+            let h = 0,
+                s = 0;
+            const l = (max + min) / 2;
+            if (max !== min) {
+                const d = max - min;
+                s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+                if (max === r) h = ((g - b) / d + (g < b ? 6 : 0)) / 6;
+                else if (max === g) h = ((b - r) / d + 2) / 6;
+                else h = ((r - g) / d + 4) / 6;
+            }
+            // Generate variants at 10%, 20%, 30%, 70%, 80%, 90% lightness
+            for (const tl of [0.08, 0.15, 0.25, 0.35, 0.65, 0.75, 0.85, 0.92]) {
+                const ts = Math.max(s * 0.6, 0.05); // reduce saturation slightly
+                const _h2r = (p, q, t) => {
+                    if (t < 0) t += 1;
+                    if (t > 1) t -= 1;
+                    if (t < 1 / 6) return p + (q - p) * 6 * t;
+                    if (t < 1 / 2) return q;
+                    if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+                    return p;
+                };
+                const q = tl < 0.5 ? tl * (1 + ts) : tl + ts - tl * ts;
+                const p = 2 * tl - q;
+                const tr = Math.round(_h2r(p, q, h + 1 / 3) * 255);
+                const tg2 = Math.round(_h2r(p, q, h) * 255);
+                const tb = Math.round(_h2r(p, q, h - 1 / 3) * 255);
+                const _hex2 = (c) => Math.min(255, Math.max(0, c)).toString(16).padStart(2, '0');
+                const variant = '#' + _hex2(tr) + _hex2(tg2) + _hex2(tb);
+                if (!paletteSet.has(variant)) tintedCandidates.push(variant);
+            }
+        }
 
         let fixedCount = 0;
 
@@ -1858,23 +2320,35 @@
             return false;
         }
 
-        // ── Expanded text-element detection ────────────────────────
-        const TEXT_TAGS = /^(H[1-6]|P|SPAN|A|LI|LABEL|TD|TH|CAPTION|FIGCAPTION|BLOCKQUOTE|CITE|Q|ABBR|EM|STRONG|B|I|U|S|SMALL|SUB|SUP|MARK|CODE|PRE|SUMMARY|DT|DD|BUTTON|LEGEND|INPUT|TEXTAREA|SELECT|OPTION|OUTPUT|METER|PROGRESS|TIME|DATA|VAR|SAMP|KBD|ADDRESS|DIV|SECTION|ARTICLE|MAIN|ASIDE|HEADER|FOOTER|NAV)$/;
-        const TEXT_ROLES = /^(heading|button|link|menuitem|option|tab|treeitem|cell|gridcell|columnheader|rowheader|tooltip|status|alert|log|marquee|timer|note)$/;
+        // ── Universal text-element detection ──────────────────────────
+        // Instead of a fixed tag list, detect ANY element that carries
+        // visible text — including custom elements, web components, etc.
+        const SKIP_TAGS =
+            /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|IFRAME|OBJECT|EMBED|SVG|IMG|VIDEO|AUDIO|CANVAS|BR|HR|WBR|META|LINK|BASE|COL|SOURCE|TRACK|PARAM|AREA|MAP)$/i;
 
-        /** Check if element is likely a text-display element */
-        function isTextElement(el) {
+        function shouldProcess(el) {
             const tag = el.tagName;
             if (!tag) return false;
-            // Standard text tags (expanded to include form & semantic elements)
-            if (TEXT_TAGS.test(tag.toUpperCase())) return true;
-            // SVG text
+            if (SKIP_TAGS.test(tag)) return false;
+
+            // Always process SVG <text> elements
             if (tag.toLowerCase() === 'text' && el.namespaceURI === 'http://www.w3.org/2000/svg') return true;
+
+            // Has direct text nodes with content
+            if (hasVisibleText(el)) return true;
+
+            // Has contenteditable
+            if (el.isContentEditable) return true;
+
             // ARIA roles that imply text content
             const role = el.getAttribute && el.getAttribute('role');
-            if (role && TEXT_ROLES.test(role.toLowerCase())) return true;
-            // Contenteditable elements
-            if (el.isContentEditable) return true;
+            if (role && /^(heading|button|link|menuitem|tab|tooltip|status|alert|note|label)$/i.test(role)) {
+                return !!(el.textContent && el.textContent.trim());
+            }
+
+            // Form elements with value text
+            if (/^(INPUT|TEXTAREA|SELECT)$/i.test(tag)) return true;
+
             return false;
         }
 
@@ -1886,87 +2360,313 @@
         }
 
         /**
-         * Aesthetic-aware candidate selection.
-         * Priority: palette colors that pass AA > b/w that pass AA > highest-CR fallback.
-         * Among passing palette colors, prefer the one closest in luminance to the
-         * original text color (preserves the palette's visual character).
+         * Detect if an element has a CSS gradient background that we should
+         * parse for color extraction. Returns the first gradient color stop's
+         * hex, or null.
          */
-        function pickBestCandidate(bgHex, origTextHex, threshold) {
-            const origLum = _cachedLum(origTextHex);
-            let bestPalette = null, bestPaletteCR = 0, bestPaletteLumDist = Infinity;
-            let bestBW = null, bestBWCR = 0;
-            let fallbackHex = null, fallbackCR = 0;
+        function _extractGradientColor(el) {
+            try {
+                const bgImage = window.getComputedStyle(el).backgroundImage;
+                if (!bgImage || bgImage === 'none') return null;
 
-            for (const c of paletteCandidates) {
-                const cr = _contrastRatio(c, bgHex);
-                if (cr >= threshold) {
-                    const dist = Math.abs(_cachedLum(c) - origLum);
-                    // Prefer palette candidate with passing CR closest to original luminance
-                    if (!bestPalette || dist < bestPaletteLumDist ||
-                        (dist === bestPaletteLumDist && cr > bestPaletteCR)) {
-                        bestPalette = c;
-                        bestPaletteCR = cr;
-                        bestPaletteLumDist = dist;
-                    }
+                let start = bgImage.toLowerCase().indexOf('gradient(');
+                if (start === -1) return null;
+
+                start += 9;
+                let depth = 1;
+                let end = start;
+                while (end < bgImage.length && depth > 0) {
+                    if (bgImage[end] === '(') depth++;
+                    else if (bgImage[end] === ')') depth--;
+                    end++;
                 }
-                if (cr > fallbackCR) { fallbackCR = cr; fallbackHex = c; }
-            }
 
-            for (const c of bwHexes) {
-                const cr = _contrastRatio(c, bgHex);
-                if (cr >= threshold && cr > bestBWCR) {
-                    bestBWCR = cr;
-                    bestBW = c;
+                if (depth !== 0) return null;
+                const contents = bgImage.substring(start, end - 1);
+
+                // Extract rgb/rgba/hex color values from gradient stops
+                const rgbMatch = contents.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
+                if (rgbMatch) {
+                    const _h2 = (c) =>
+                        Math.min(255, Math.max(0, parseInt(c)))
+                            .toString(16)
+                            .padStart(2, '0');
+                    return '#' + _h2(rgbMatch[1]) + _h2(rgbMatch[2]) + _h2(rgbMatch[3]);
                 }
-                if (cr > fallbackCR) { fallbackCR = cr; fallbackHex = c; }
-            }
-
-            // Prefer palette color over b/w when both pass
-            if (bestPalette) return { hex: bestPalette, cr: bestPaletteCR };
-            if (bestBW) return { hex: bestBW, cr: bestBWCR };
-            // Nothing passes — return highest-contrast regardless
-            return fallbackHex ? { hex: fallbackHex, cr: fallbackCR } : null;
+                const hexMatch = contents.match(/#([0-9a-f]{3,8})\b/i);
+                if (hexMatch) {
+                    let h = hexMatch[1].toLowerCase();
+                    if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+                    if (h.length >= 6) return '#' + h.substring(0, 6);
+                }
+            } catch (_) {}
+            return null;
         }
 
+        /**
+         * Enhanced effective background: considers CSS gradients, overlay
+         * elements, and walks deeper into the ancestor chain.
+         */
+        function _getDeepEffectiveBg(el, textColorHex = null) {
+            // First try the standard bg detection
+            const standardBg = _getEffectiveBg(el);
+
+            // Additionally check if any ancestor has a gradient — use the
+            // gradient's dominant color for contrast (usually the darkest
+            // or lightest stop).
+            let current = el;
+            let depth = 0;
+            while (current && depth < 15) {
+                const gradColor = _extractGradientColor(current);
+                if (gradColor) {
+                    // Use the gradient color if it's darker or lighter than
+                    // the standard bg (pick the one that's harder to contrast
+                    // against, i.e., worst-case for text readability).
+                    const gradLum = _cachedLum(gradColor);
+                    const stdLum = _cachedLum(standardBg);
+
+                    if (textColorHex) {
+                        const stdCR = _contrastRatio(textColorHex, standardBg);
+                        const gradCR = _contrastRatio(textColorHex, gradColor);
+                        return gradCR < stdCR ? gradColor : standardBg;
+                    }
+
+                    // If the gradient color is between the text and bg luminance,
+                    // it could obscure text — use it for a more conservative check
+                    return gradLum < stdLum ? gradColor : standardBg;
+                }
+                current = current.parentElement;
+                depth++;
+            }
+
+            return standardBg;
+        }
+
+        /**
+         * Deep candidate selection — guarantees the best possible text color.
+         *
+         * Strategy (in priority order):
+         *  1. Palette color that meets AAA target → pick highest CR
+         *  2. Tinted palette variant that meets AAA target → highest CR
+         *  3. Palette color that meets AA minimum → highest CR
+         *  4. Tinted variant that meets AA minimum → highest CR
+         *  5. Black or white that meets AA minimum → higher CR
+         *  6. Synthesized optimal-contrast color on the original hue
+         *  7. Gray ramp scan for the highest-CR gray
+         *  8. Pure black or white (whichever has higher CR) — always ≥ ABSOLUTE_MIN
+         */
+        function pickBestCandidate(bgHex, origTextHex, targetCR, minCR) {
+            const bgLum = _cachedLum(bgHex);
+            const origLum = _cachedLum(origTextHex);
+
+            // ─ Helper: score a candidate (higher = better) ─
+            // Balances contrast ratio (60%) with hue/luminance proximity to
+            // the original text color (40%) so we don't gratuitously shift
+            // the color far from the design intent.
+            const scoreFn = (hex, cr) => {
+                const proximity = 1 - Math.abs(_cachedLum(hex) - origLum);
+                return cr * 0.6 + proximity * 0.4 * 21; // normalized to ~21 scale
+            };
+
+            let best = null;
+
+            // ─ Pass 1: Palette colors ─────────────────────────────────
+            for (const c of paletteCandidates) {
+                const cr = _contrastRatio(c, bgHex);
+                if (cr >= targetCR) {
+                    const sc = scoreFn(c, cr);
+                    if (!best || sc > best.score || (sc === best.score && cr > best.cr)) {
+                        best = { hex: c, cr, score: sc, tier: 1 };
+                    }
+                }
+            }
+            if (best) return best;
+
+            // ─ Pass 2: Tinted palette variants (AAA target) ───────────
+            for (const c of tintedCandidates) {
+                const cr = _contrastRatio(c, bgHex);
+                if (cr >= targetCR) {
+                    const sc = scoreFn(c, cr);
+                    if (!best || sc > best.score) {
+                        best = { hex: c, cr, score: sc, tier: 2 };
+                    }
+                }
+            }
+            if (best) return best;
+
+            // ─ Pass 3: Palette colors at AA minimum ───────────────────
+            for (const c of paletteCandidates) {
+                const cr = _contrastRatio(c, bgHex);
+                if (cr >= minCR) {
+                    const sc = scoreFn(c, cr);
+                    if (!best || sc > best.score) {
+                        best = { hex: c, cr, score: sc, tier: 3 };
+                    }
+                }
+            }
+            if (best) return best;
+
+            // ─ Pass 4: Tinted variants at AA minimum ──────────────────
+            for (const c of tintedCandidates) {
+                const cr = _contrastRatio(c, bgHex);
+                if (cr >= minCR) {
+                    const sc = scoreFn(c, cr);
+                    if (!best || sc > best.score) {
+                        best = { hex: c, cr, score: sc, tier: 4 };
+                    }
+                }
+            }
+            if (best) return best;
+
+            // ─ Pass 5: Black/White ────────────────────────────────────
+            for (const c of bwHexes) {
+                const cr = _contrastRatio(c, bgHex);
+                if (cr >= minCR) {
+                    if (!best || cr > best.cr) {
+                        best = { hex: c, cr, score: cr, tier: 5 };
+                    }
+                }
+            }
+            if (best) return best;
+
+            // ─ Pass 6: Synthesized hue-preserving color ───────────────
+            // Extract the hue from the original text color and binary-search
+            // for the lightness that maximizes contrast against the bg.
+            try {
+                const origRgb = window.ColorUtils.hexToRgb(origTextHex);
+                if (origRgb) {
+                    const r = origRgb.r / 255,
+                        g = origRgb.g / 255,
+                        bl = origRgb.b / 255;
+                    const mx = Math.max(r, g, bl),
+                        mn = Math.min(r, g, bl);
+                    let hue = 0,
+                        sat = 0;
+                    if (mx !== mn) {
+                        const d = mx - mn;
+                        sat = Math.min(d / (1 - Math.abs(mx + mn - 1) + 1e-9), 1);
+                        if (mx === r) hue = ((g - bl) / d + (g < bl ? 6 : 0)) / 6;
+                        else if (mx === g) hue = ((bl - r) / d + 2) / 6;
+                        else hue = ((r - g) / d + 4) / 6;
+                    }
+                    // Determine direction: if bg is dark, push text light; if bg is light, push text dark
+                    const targetL = bgLum < 0.5 ? 0.95 : 0.05;
+                    const _hsl2hex = (h, s, ll) => {
+                        const q2 = ll < 0.5 ? ll * (1 + s) : ll + s - ll * s;
+                        const p2 = 2 * ll - q2;
+                        const _h2r2 = (pp, qq, t) => {
+                            if (t < 0) t += 1;
+                            if (t > 1) t -= 1;
+                            if (t < 1 / 6) return pp + (qq - pp) * 6 * t;
+                            if (t < 1 / 2) return qq;
+                            if (t < 2 / 3) return pp + (qq - pp) * (2 / 3 - t) * 6;
+                            return pp;
+                        };
+                        const rr = Math.round(_h2r2(p2, q2, h + 1 / 3) * 255);
+                        const gg = Math.round(_h2r2(p2, q2, h) * 255);
+                        const bb = Math.round(_h2r2(p2, q2, h - 1 / 3) * 255);
+                        const _hx = (c) => Math.min(255, Math.max(0, c)).toString(16).padStart(2, '0');
+                        return '#' + _hx(rr) + _hx(gg) + _hx(bb);
+                    };
+                    // Binary search for optimal lightness
+                    let lo = bgLum < 0.5 ? 0.5 : 0.0;
+                    let hi = bgLum < 0.5 ? 1.0 : 0.5;
+                    let bestSynth = null;
+                    for (let iter = 0; iter < 12; iter++) {
+                        const mid = (lo + hi) / 2;
+                        const candidate = _hsl2hex(hue, sat * 0.4, mid);
+                        const cr = _contrastRatio(candidate, bgHex);
+                        if (cr >= minCR) {
+                            if (!bestSynth || Math.abs(mid - targetL) < Math.abs(bestSynth.l - targetL)) {
+                                bestSynth = { hex: candidate, cr, l: mid };
+                            }
+                            // Move toward target lightness
+                            if (mid < targetL) lo = mid;
+                            else hi = mid;
+                        } else {
+                            // Need more contrast — move away from bg
+                            if (bgLum < 0.5) lo = mid;
+                            else hi = mid;
+                        }
+                    }
+                    if (bestSynth && bestSynth.cr >= minCR) {
+                        return { hex: bestSynth.hex, cr: bestSynth.cr, score: bestSynth.cr, tier: 6 };
+                    }
+                }
+            } catch (_) {}
+
+            // ─ Pass 7: Gray ramp — find highest-contrast neutral ──────
+            let bestGray = null;
+            for (const c of grayRamp) {
+                const cr = _contrastRatio(c, bgHex);
+                if (cr >= ABSOLUTE_MIN && (!bestGray || cr > bestGray.cr)) {
+                    bestGray = { hex: c, cr, score: cr, tier: 7 };
+                }
+            }
+            if (bestGray) return bestGray;
+
+            // ─ Pass 8: Absolute fallback — black or white ─────────────
+            // One of them is always ≥ ~1.05:1; pick the better one
+            const wCR = _contrastRatio('#ffffff', bgHex);
+            const bCR = _contrastRatio('#000000', bgHex);
+            return wCR >= bCR
+                ? { hex: '#ffffff', cr: wCR, score: wCR, tier: 8 }
+                : { hex: '#000000', cr: bCR, score: bCR, tier: 8 };
+        }
+
+        // ── Element processor (only touches `color`) ──────────────────
         const processElement = (el) => {
             try {
-                const directText = hasVisibleText(el);
-                const isTextTag = isTextElement(el);
-
-                if (!directText && !isTextTag) return;
-
-                // For text tags without direct text, check if they contain text at all
-                if (!directText && isTextTag) {
-                    if (!el.textContent || !el.textContent.trim()) return;
-                }
+                if (!shouldProcess(el)) return;
 
                 const style = window.getComputedStyle(el);
 
-                // Skip hidden elements
-                if (style.display === 'none' || style.visibility === 'hidden' ||
-                    parseFloat(style.opacity) < 0.1) return;
-                // Skip zero-size elements (collapsed, overflow:hidden wrappers)
-                if (el.offsetWidth === 0 && el.offsetHeight === 0) return;
+                // Skip hidden elements — use CSS-only checks to avoid layout-forcing
+                // properties like offsetWidth/offsetHeight which cause reflow per element.
+                if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse')
+                    return;
+                const opacity = parseFloat(style.opacity);
+                if (opacity < 0.05) return;
+                // Skip elements clipped out of view
+                const clip = style.clip;
+                if (clip && clip !== 'auto' && clip.includes('rect(0') && clip.includes('0px, 0px)')) return;
+                // Skip elements with text-indent pushing text off-screen (common a11y hack)
+                const textIndent = parseFloat(style.textIndent);
+                if (textIndent < -900) return;
 
                 const textColor = style.color;
                 if (!textColor || window.ColorUtils.isTransparent(textColor)) return;
 
                 const textHex = window.ColorUtils.rgbToHex8(textColor).toLowerCase();
-                const bgHex = _getEffectiveBg(el);
+                const bgHex = _getDeepEffectiveBg(el);
                 const currentCR = _contrastRatio(textHex, bgHex);
 
-                // Use relaxed threshold for large text
-                const threshold = isLargeText(style) ? MIN_CR_LARGE : MIN_CR;
+                // Determine thresholds based on text size
+                const large = isLargeText(style);
+                const targetCR = large ? TARGET_CR_LG : TARGET_CR;
+                const minCR = large ? MIN_CR_LARGE : MIN_CR;
 
-                if (currentCR >= threshold) return; // already fine
+                // Factor in accumulated opacity from ancestors — text may be
+                // semi-transparent itself, reducing effective contrast.
+                let effectiveCR = currentCR;
+                if (opacity < 1 && opacity > 0.05) {
+                    // Semi-transparent text has reduced effective contrast.
+                    // Approximate: CR_effective ≈ 1 + (CR_actual - 1) * opacity
+                    effectiveCR = 1 + (currentCR - 1) * opacity;
+                }
 
-                const best = pickBestCandidate(bgHex, textHex, threshold);
-                if (best && best.cr > currentCR) {
+                // Already meets the target? No fix needed.
+                if (effectiveCR >= targetCR) return;
+
+                const best = pickBestCandidate(bgHex, textHex, targetCR, minCR);
+                if (best && best.cr > effectiveCR) {
                     el.style.setProperty('color', best.hex, 'important');
                     _textContrastFixed.add(el);
                     fixedCount++;
                 }
-            } catch (e) { /* ignore */ }
+            } catch (e) {
+                /* ignore */
+            }
         };
 
         // ── Subtree path: small bounded scope, always synchronous ──────────
@@ -1978,40 +2678,36 @@
                 }
             });
             if (fixedCount > 0) {
-                console.log(`PaletteLive: Text contrast enforced on ${fixedCount} elements (subtree)`);
+                PLLog.info(`Text contrast enforced on ${fixedCount} elements (subtree)`);
             }
             return fixedCount;
         }
 
         // ── Full-DOM path: chunked async to prevent main-thread freeze ───────
-        // Use querySelectorAll instead of ShadowWalker.walk — Chrome's native
-        // selector engine collects only matching nodes and is ~50× faster than
-        // a JS callback visiting every element.  Results are then processed in
-        // CHUNK_SIZE batches separated by setTimeout(0) so the browser can
-        // handle input/rendering between chunks and the page never freezes.
-        const _tagSel =
-            'h1,h2,h3,h4,h5,h6,p,span,a,li,label,td,th,caption,' +
-            'figcaption,blockquote,cite,q,abbr,em,strong,b,i,u,s,small,sub,sup,' +
-            'mark,code,pre,summary,dt,dd,button,legend,input,textarea,select,option,' +
-            'time,address,var,samp,kbd,' +
-            'div,section,article,main,aside,header,footer,nav,' +
-            '[role="heading"],[role="button"],[role="link"],[role="menuitem"],' +
-            '[contenteditable="true"]';
+        // Use a universal selector (*) filtered by shouldProcess to catch ALL
+        // text-bearing elements including custom elements, web components, and
+        // any tag with direct text nodes.  Processed in CHUNK_SIZE batches
+        // separated by setTimeout(0) so the browser stays responsive.
         const _candidates = [];
         try {
-            document.querySelectorAll(_tagSel).forEach(el => _candidates.push(el));
-        } catch (e) { /* ignore */ }
-        [document.documentElement, document.body].forEach(root => {
+            // Broad selector that catches everything including custom elements
+            const allEls = document.body.querySelectorAll('*');
+            for (let i = 0; i < allEls.length; i++) {
+                _candidates.push(allEls[i]);
+            }
+        } catch (e) {
+            /* ignore */
+        }
+        // Also include html and body themselves
+        [document.documentElement, document.body].forEach((root) => {
             if (root) _candidates.unshift(root);
         });
 
-        // Hard cap: elements beyond MAX_ELEMENTS are likely off-screen on
-        // high-churn pages (Reddit, Twitter). They will be caught by the next
-        // scroll/mutation-triggered pass once they scroll into view.
-        const _MAX_EL = 3000;
+        // Hard cap to prevent freezing on massive pages
+        const _MAX_EL = PLConfig.CONTRAST_MAX_ELEMENTS;
         if (_candidates.length > _MAX_EL) _candidates.length = _MAX_EL;
 
-        const _CHUNK = 60;
+        const _CHUNK = 80;
         let _ci = 0;
         const _runChunk = () => {
             performDOMChange(() => {
@@ -2020,8 +2716,11 @@
             });
             if (_ci < _candidates.length) {
                 setTimeout(_runChunk, 0);
-            } else if (fixedCount > 0) {
-                console.log(`PaletteLive: Text contrast enforced on ${fixedCount} elements`);
+            } else {
+                if (fixedCount > 0) {
+                    PLLog.info(`Text contrast enforced on ${fixedCount} elements (deep scan)`);
+                }
+                if (typeof onComplete === 'function') onComplete(fixedCount);
             }
         };
         _runChunk();
@@ -2051,7 +2750,7 @@
     }
 
     function clearHighlight() {
-        highlightedElements.forEach(element => {
+        highlightedElements.forEach((element) => {
             try {
                 element.removeAttribute('data-pl-highlight');
             } catch (error) {
@@ -2104,10 +2803,7 @@
         }
     }
 
-    function toRgba(hex, alpha) {
-        const { r, g, b } = window.ColorUtils.hexToRgb(hex);
-        return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-    }
+    // NOTE: duplicate toRgba() removed — single definition above is used.
 
     function updateHighlightStyle(hex) {
         const style = ensureHighlightStyle();
@@ -2118,7 +2814,7 @@
             '  outline-offset: 2px !important;',
             `  box-shadow: 0 0 0 2px ${glow} !important;`,
             '  transition: outline-color 200ms ease, box-shadow 200ms ease;',
-            '}'
+            '}',
         ].join('\n');
     }
 
@@ -2126,6 +2822,12 @@
     window.__plHighlightColor = highlightColor;
     window.__plHighlightElement = highlightElement;
     window.__plClearHighlight = clearHighlight;
+    Object.defineProperty(window, 'dispatchSecureDropperEvent', {
+        value: dispatchSecureDropperEvent,
+        enumerable: false,
+        writable: false,
+        configurable: true,
+    });
 
     function clonePlainObject(value) {
         return JSON.parse(JSON.stringify(value || {}));
@@ -2134,14 +2836,31 @@
     function ensureComparisonStyle() {
         const style = ensureStyleElement(comparisonStyleId);
         style.textContent = [
-            `#${comparisonOverlayId} { position: fixed; inset: 0; z-index: 2147483646; pointer-events: auto; --pl-divider: 50%; cursor: ew-resize; user-select: none; }`,
-            `#${comparisonOverlayId} .pl-compare-before, #${comparisonOverlayId} .pl-compare-after { position: absolute; inset: 0; background-repeat: no-repeat; background-size: 100% auto; background-position: top left; }`,
-            `#${comparisonOverlayId} .pl-compare-before { clip-path: inset(0 calc(100% - var(--pl-divider)) 0 0); }`,
-            `#${comparisonOverlayId} .pl-compare-after { clip-path: inset(0 0 0 var(--pl-divider)); }`,
-            `#${comparisonOverlayId} .pl-compare-divider { position: absolute; top: 0; bottom: 0; left: var(--pl-divider); width: 2px; transform: translateX(-1px); background: #fff; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35); }`,
-            `#${comparisonOverlayId} .pl-compare-badge { position: absolute; left: 12px; top: 12px; padding: 4px 8px; border-radius: 6px; font: 600 12px/1 -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; color: #fff; background: rgba(0, 0, 0, 0.55); pointer-events: none; }`,
-            `#${comparisonOverlayId} .pl-compare-close { position: absolute; top: 12px; right: 12px; width: 28px; height: 28px; border: none; border-radius: 6px; background: rgba(0, 0, 0, 0.55); color: #fff; font: 700 16px/1 -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif; cursor: pointer; }`,
-            `#${comparisonOverlayId} .pl-compare-close:hover { background: rgba(0, 0, 0, 0.7); }`
+            // Full-screen overlay. pointer-events is NONE by default so scrolling
+            // and clicking on the live page (right half) works normally. The
+            // overlay temporarily switches to 'auto' only while the divider is
+            // being dragged.
+            `#${comparisonOverlayId} { position: fixed; inset: 0; z-index: 2147483646; pointer-events: none; --pl-divider: 50%; user-select: none; overflow: hidden; }`,
+            // Before pane (original screenshot) — clipped to the left portion.
+            // background-position-y is updated via JS as the page scrolls so the
+            // screenshot tracks the visible viewport.
+            `#${comparisonOverlayId} .pl-compare-before { position: absolute; inset: 0; background-repeat: no-repeat; background-size: 100% 100%; background-position: 0 0; clip-path: inset(0 calc(100% - var(--pl-divider)) 0 0); pointer-events: none; }`,
+            // After pane — screenshot of the page WITH PaletteLive changes applied,
+            // captured at the same scroll position as the before screenshot.
+            `#${comparisonOverlayId} .pl-compare-after { position: absolute; inset: 0; background-repeat: no-repeat; background-size: 100% 100%; background-position: 0 0; clip-path: inset(0 0 0 var(--pl-divider)); pointer-events: none; }`,
+            // Thin visual divider line.
+            `#${comparisonOverlayId} .pl-compare-divider { position: absolute; top: 0; bottom: 0; left: var(--pl-divider); width: 3px; transform: translateX(-1px); background: #fff; box-shadow: 0 0 0 1px rgba(0,0,0,.4); pointer-events: none; }`,
+            // Drag handle — visible grab target on the divider line. This is the
+            // only interactive zone on the before side; pointer-events: auto allows
+            // pointerdown here to start a drag.
+            `#${comparisonOverlayId} .pl-compare-handle { position: absolute; top: 50%; left: var(--pl-divider); transform: translate(-50%, -50%); width: 36px; height: 36px; border-radius: 50%; background: #fff; box-shadow: 0 2px 6px rgba(0,0,0,.4); display: flex; align-items: center; justify-content: center; font: 700 14px/1 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif; color: #555; cursor: ew-resize; pointer-events: auto; }`,
+            // "Before" label — bottom-left.
+            `#${comparisonOverlayId} .pl-compare-badge-before { position: absolute; bottom: 12px; left: 12px; padding: 4px 8px; border-radius: 6px; font: 600 12px/1 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif; color: #fff; background: rgba(0,0,0,.55); pointer-events: none; }`,
+            // "After" label — positioned just right of the divider.
+            `#${comparisonOverlayId} .pl-compare-badge-after { position: absolute; bottom: 12px; padding: 4px 8px; border-radius: 6px; font: 600 12px/1 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif; color: #fff; background: rgba(0,0,0,.55); pointer-events: none; left: calc(var(--pl-divider) + 12px); }`,
+            // Close button — must be auto so it can be clicked.
+            `#${comparisonOverlayId} .pl-compare-close { position: absolute; top: 12px; right: 12px; width: 28px; height: 28px; border: none; border-radius: 6px; background: rgba(0,0,0,.55); color: #fff; font: 700 16px/1 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif; cursor: pointer; pointer-events: auto; }`,
+            `#${comparisonOverlayId} .pl-compare-close:hover { background: rgba(0,0,0,.75); }`,
         ].join('\n');
     }
 
@@ -2180,11 +2899,17 @@
     function showComparisonOverlay(payload) {
         const beforeImage = payload.beforeImage;
         const afterImage = payload.afterImage;
-        if (!beforeImage || !afterImage) {
-            throw new Error('Missing comparison images');
+        if (!beforeImage) {
+            throw new Error('Missing beforeImage for comparison');
         }
-        if (!isSafeCssImageUrl(beforeImage) || !isSafeCssImageUrl(afterImage)) {
-            throw new Error('Invalid comparison image URL: only data:image/ and https:// are allowed');
+        if (!afterImage) {
+            throw new Error('Missing afterImage for comparison');
+        }
+        if (!isSafeCssImageUrl(beforeImage)) {
+            throw new Error('Invalid beforeImage URL: only data:image/ and https:// are allowed');
+        }
+        if (!isSafeCssImageUrl(afterImage)) {
+            throw new Error('Invalid afterImage URL: only data:image/ and https:// are allowed');
         }
 
         hideComparisonOverlay();
@@ -2192,70 +2917,119 @@
 
         const overlay = document.createElement('div');
         overlay.id = comparisonOverlayId;
-        overlay.innerHTML = [
-            '<div class="pl-compare-before"></div>',
-            '<div class="pl-compare-after"></div>',
-            '<div class="pl-compare-divider" role="separator" aria-label="Comparison divider"></div>',
-            '<div class="pl-compare-badge">Before | After</div>',
-            '<button type="button" class="pl-compare-close" aria-label="Close comparison">x</button>'
-        ].join('');
 
-        const beforePane = overlay.querySelector('.pl-compare-before');
-        const afterPane = overlay.querySelector('.pl-compare-after');
-        const closeBtn = overlay.querySelector('.pl-compare-close');
+        // Both panes are screenshots — left = original site colors (before),
+        // right = page with PaletteLive changes applied (after).
+        const beforePane = document.createElement('div');
+        beforePane.className = 'pl-compare-before';
 
-        beforePane.style.backgroundImage = `url("${sanitizeCssUrl(beforeImage)}")`;
-        afterPane.style.backgroundImage = `url("${sanitizeCssUrl(afterImage)}")`;
+        const afterPane = document.createElement('div');
+        afterPane.className = 'pl-compare-after';
+
+        const dividerEl = document.createElement('div');
+        dividerEl.className = 'pl-compare-divider';
+
+        const handleEl = document.createElement('div');
+        handleEl.className = 'pl-compare-handle';
+        handleEl.setAttribute('aria-hidden', 'true');
+        handleEl.textContent = '\u2194'; // ↔ arrows hinting at drag direction
+
+        const badgeBefore = document.createElement('div');
+        badgeBefore.className = 'pl-compare-badge-before';
+        badgeBefore.textContent = 'Original';
+
+        const badgeAfter = document.createElement('div');
+        badgeAfter.className = 'pl-compare-badge-after';
+        badgeAfter.textContent = 'Your changes';
+
+        const closeBtn = document.createElement('button');
+        closeBtn.type = 'button';
+        closeBtn.className = 'pl-compare-close';
+        closeBtn.setAttribute('aria-label', 'Close comparison');
+        closeBtn.textContent = '\xd7'; // ×
+
+        overlay.appendChild(beforePane);
+        overlay.appendChild(afterPane);
+        overlay.appendChild(dividerEl);
+        overlay.appendChild(handleEl);
+        overlay.appendChild(badgeBefore);
+        overlay.appendChild(badgeAfter);
+        overlay.appendChild(closeBtn);
+
+        // Both screenshots were taken at the same scroll position — set them on
+        // their respective panes. No scroll tracking needed.
+        beforePane.style.backgroundImage = `url("${sanitizeCssUrl(beforeImage)}")`;  // original colors
+        afterPane.style.backgroundImage = `url("${sanitizeCssUrl(afterImage)}")`;    // modified colors
+
         let divider = Number(payload.divider);
         if (!Number.isFinite(divider)) divider = 50;
 
         const setDivider = (value) => {
             const safe = Math.max(0, Math.min(100, value));
             overlay.style.setProperty('--pl-divider', `${safe}%`);
+            badgeAfter.style.left = `calc(${safe}% + 12px)`;
+            handleEl.style.left = `${safe}%`;
         };
 
-        const toDivider = (event) => {
+        const toDividerFromClientX = (clientX) => {
             const width = Math.max(1, window.innerWidth || document.documentElement.clientWidth || 1);
-            return (event.clientX / width) * 100;
+            return (clientX / width) * 100;
         };
 
         setDivider(divider);
 
+        // Dragging: the overlay is pointer-events:none normally (so the user can
+        // still scroll the page with the overlay open). We enable pointer-events
+        // only while the user is actively dragging the divider handle.
         let dragging = false;
-        const onPointerDown = (event) => {
+        const onHandlePointerDown = (event) => {
             dragging = true;
-            setDivider(toDivider(event));
+            overlay.style.pointerEvents = 'auto';
+            overlay.style.cursor = 'ew-resize';
+            overlay.setPointerCapture(event.pointerId);
+            setDivider(toDividerFromClientX(event.clientX));
             event.preventDefault();
         };
         const onPointerMove = (event) => {
             if (!dragging) return;
-            setDivider(toDivider(event));
+            setDivider(toDividerFromClientX(event.clientX));
             event.preventDefault();
         };
-        const onPointerUp = () => {
+        const onPointerUp = (event) => {
+            if (dragging) {
+                try { overlay.releasePointerCapture(event.pointerId); } catch (_) {}
+                overlay.style.pointerEvents = 'none';
+                overlay.style.cursor = '';
+            }
             dragging = false;
         };
 
-        overlay.addEventListener('pointerdown', onPointerDown);
+        handleEl.addEventListener('pointerdown', onHandlePointerDown);
         overlay.addEventListener('pointermove', onPointerMove);
         overlay.addEventListener('pointerup', onPointerUp);
         overlay.addEventListener('pointercancel', onPointerUp);
 
         closeBtn.addEventListener('click', (event) => {
-            event.preventDefault();
+            event.stopPropagation();
             hideComparisonOverlay();
-            try {
-                chrome.runtime.sendMessage({ type: 'PL_COMPARISON_OVERLAY_CLOSED' });
-            } catch (error) {
-                // Ignore popup-messaging failures when popup is closed.
-            }
+            safeSendRuntimeMessage({ type: 'PL_COMPARISON_OVERLAY_CLOSED' });
         });
 
+        // Escape key closes overlay
+        const onKeyDown = (event) => {
+            if (event.key === 'Escape' || event.key === 'Esc') {
+                hideComparisonOverlay();
+                safeSendRuntimeMessage({ type: 'PL_COMPARISON_OVERLAY_CLOSED' });
+            }
+        };
+        document.addEventListener('keydown', onKeyDown, true);
+
         comparisonPointerCleanup = () => {
-            overlay.removeEventListener('pointerdown', onPointerDown);
+            handleEl.removeEventListener('pointerdown', onHandlePointerDown);
             overlay.removeEventListener('pointermove', onPointerMove);
             overlay.removeEventListener('pointerup', onPointerUp);
             overlay.removeEventListener('pointercancel', onPointerUp);
+            document.removeEventListener('keydown', onKeyDown, true);
         };
 
         document.documentElement.appendChild(overlay);
@@ -2264,17 +3038,18 @@
     function suspendForComparison() {
         if (comparisonSnapshot) return;
 
-        const injectorState = (window.Injector && window.Injector.state)
-            ? {
-                variables: clonePlainObject(window.Injector.state.variables),
-                selectors: clonePlainObject(window.Injector.state.selectors)
-            }
-            : { variables: {}, selectors: {} };
+        const injectorState =
+            window.Injector && window.Injector.state
+                ? {
+                      variables: clonePlainObject(window.Injector.state.variables),
+                      selectors: clonePlainObject(window.Injector.state.selectors),
+                  }
+                : { variables: {}, selectors: {} };
 
         comparisonSnapshot = {
             raw: Array.from(rawOverrideState.entries()).map(([original, current]) => ({ original, current })),
             injectorState,
-            heatmapActive: !!(window.Heatmap && window.Heatmap.isActive)
+            heatmapActive: !!(window.Heatmap && window.Heatmap.isActive),
         };
 
         if (comparisonSnapshot.heatmapActive && window.Heatmap) {
@@ -2290,6 +3065,14 @@
         stopOverrideWatchdog();
 
         resetAllOverrides({ preserveScheme: true, preserveVision: true, skipObserverReconnect: true });
+
+        // Force a synchronous style flush so the browser fully processes all the
+        // inline style removals and Injector CSS reset before we return.  Reading
+        // a layout property (getBoundingClientRect) causes the browser to drain
+        // the style/layout pipeline immediately — without this, fast machines can
+        // skip the forced style recalc and the 'before' screenshot may still show
+        // residual override colors, especially when there are many changes.
+        try { document.documentElement.getBoundingClientRect(); } catch (e) { /* ignore */ }
     }
 
     function restoreAfterComparison() {
@@ -2303,11 +3086,16 @@
             window.Injector.apply(snapshot.injectorState || {});
         }
 
-        if (Array.isArray(snapshot.raw)) {
-            snapshot.raw.forEach(entry => {
-                if (!entry || !entry.original || !entry.current) return;
-                applyRawOverride({ original: entry.original, current: entry.current });
-            });
+        // Use bulk application instead of individual applyRawOverride calls.
+        // With many changes this is critical: N individual calls = N DOM walks,
+        // each calling ensureColorMap() + buildColorMap() separately, which is
+        // very slow and causes the restore to appear glitchy/incomplete.
+        // applyBulkRawOverrides does a single optimised DOM walk for all overrides.
+        if (Array.isArray(snapshot.raw) && snapshot.raw.length > 0) {
+            const validEntries = snapshot.raw.filter((e) => e && e.original && e.current);
+            if (validEntries.length > 0) {
+                applyBulkRawOverrides(validEntries.map((e) => ({ original: e.original, current: e.current })));
+            }
         }
 
         if (snapshot.heatmapActive && window.Heatmap) {
@@ -2322,7 +3110,7 @@
                 childList: true,
                 subtree: true,
                 attributes: true,
-                attributeFilter: ['class', 'style']
+                attributeFilter: ['class', 'style'],
             });
         }
         if (rawOverrideState.size > 0) {
@@ -2338,13 +3126,15 @@
         if (window.Injector && typeof window.Injector.apply === 'function') {
             window.Injector.apply(savedData.overrides);
         } else {
-            console.warn('PaletteLive: Injector not available, skipping apply');
+            PLLog.warn(' Injector not available, skipping apply');
         }
 
         if (savedData.overrides.raw) {
-            Object.entries(savedData.overrides.raw).forEach(([original, current]) => {
-                applyRawOverride({ original, current });
-            });
+            const overridesArray = Object.entries(savedData.overrides.raw).map(([original, current]) => ({
+                original,
+                current,
+            }));
+            applyBulkRawOverrides(overridesArray);
         }
 
         if (savedData.settings && savedData.settings.scheme) {
@@ -2355,9 +3145,7 @@
         }
 
         // Re-run text contrast enforcement with the saved palette hexes
-        const paletteHexes = Array.isArray(savedData.appliedPaletteHexes)
-            ? savedData.appliedPaletteHexes
-            : null;
+        const paletteHexes = Array.isArray(savedData.appliedPaletteHexes) ? savedData.appliedPaletteHexes : null;
         if (paletteHexes && paletteHexes.length) {
             _lastPaletteHexes = paletteHexes;
             _textContrastFixed = new WeakSet();
@@ -2369,14 +3157,16 @@
                     enforceTextContrast(paletteHexes);
                 }, 300);
             }, 150);
-            const idleCb = typeof requestIdleCallback === 'function'
-                ? requestIdleCallback
-                : (fn) => setTimeout(fn, 1000);
-            idleCb(() => {
-                if (_lastPaletteHexes === paletteHexes) {
-                    enforceTextContrast(paletteHexes);
-                }
-            }, { timeout: 2000 });
+            const idleCb =
+                typeof requestIdleCallback === 'function' ? requestIdleCallback : (fn) => setTimeout(fn, 1000);
+            idleCb(
+                () => {
+                    if (_lastPaletteHexes === paletteHexes) {
+                        enforceTextContrast(paletteHexes);
+                    }
+                },
+                { timeout: 2000 }
+            );
         }
     }
 
@@ -2389,20 +3179,7 @@
     function processAddedSubtree(node) {
         if (!node || node.nodeType !== 1) return;
 
-        const props = [
-            { js: 'backgroundColor', css: 'background-color' },
-            { js: 'color', css: 'color' },
-            { js: 'borderTopColor', css: 'border-top-color' },
-            { js: 'borderRightColor', css: 'border-right-color' },
-            { js: 'borderBottomColor', css: 'border-bottom-color' },
-            { js: 'borderLeftColor', css: 'border-left-color' },
-            { js: 'outlineColor', css: 'outline-color' },
-            { js: 'textDecorationColor', css: 'text-decoration-color' },
-            { js: 'caretColor', css: 'caret-color' },
-            { js: 'columnRuleColor', css: 'column-rule-color' },
-            { js: 'fill', css: 'fill' },
-            { js: 'stroke', css: 'stroke' }
-        ];
+        const props = _COLOR_SCAN_PROPS;
 
         const processElement = (element) => {
             // When a media element enters the DOM (lazy-loaded image/video),
@@ -2416,7 +3193,14 @@
                 props.forEach(({ js, css }) => {
                     const value = style[js];
                     if (!value || window.ColorUtils.isTransparent(value)) return;
-                    if (value === 'auto' || value === 'initial' || value === 'inherit' || value === 'currentcolor' || value === 'currentColor') return;
+                    if (
+                        value === 'auto' ||
+                        value === 'initial' ||
+                        value === 'inherit' ||
+                        value === 'currentcolor' ||
+                        value === 'currentColor'
+                    )
+                        return;
 
                     const hex = window.ColorUtils.rgbToHex8(value).toLowerCase();
                     if (!hex || (hex === '#000000' && value === 'rgba(0, 0, 0, 0)')) return;
@@ -2444,7 +3228,9 @@
                             try {
                                 const effBg = _getEffectiveBg(element);
                                 if (_contrastRatio(current, effBg) < 4.5) return;
-                            } catch (e) { /* ignore — proceed with override */ }
+                            } catch (e) {
+                                /* ignore — proceed with override */
+                            }
                         }
                         try {
                             captureInlineSnapshot(element, css);
@@ -2467,17 +3253,22 @@
                             colorElementMap.get(hex).push({ element, cssProp: 'accent-color' });
                         }
                     }
-                } catch (error) { /* ignore */ }
+                } catch (error) {
+                    /* ignore */
+                }
             } catch (error) {
                 // Ignore per-element failures.
             }
         };
 
         if (window.ShadowWalker && typeof window.ShadowWalker.walk === 'function') {
+            // ShadowWalker.walk already processes `node` as the root element,
+            // so no need to call processElement(node) separately.
             window.ShadowWalker.walk(node, processElement);
+        } else {
+            // Fallback: process just the node itself (no shadow DOM traversal)
+            processElement(node);
         }
-        // Also process the node itself if it's an element
-        processElement(node);
 
         // Enforce text contrast immediately on the newly processed subtree.
         // We call per-subtree (not global) so it's fast even on React pages
@@ -2501,7 +3292,7 @@
         childList: true,
         subtree: true,
         attributes: true,
-        attributeFilter: ['class', 'style']
+        attributeFilter: ['class', 'style'],
     };
 
     function createObserver() {
@@ -2512,6 +3303,9 @@
             if (__plPaused) return;
             // Check if we are currently applying overrides (should be caught by performDOMChange, but safely check)
             if (window.__plIsApplyingOverrides) return;
+            // Dropper is active — skip all observer processing to avoid
+            // expensive DOM work competing with the dropper's RAF loop.
+            if (_plDropperActive) return;
 
             // Rate-limit: reset counter every 60 seconds
             const now = Date.now();
@@ -2520,23 +3314,26 @@
                 observerRescanWindow = now;
                 if (observerPaused) {
                     observerPaused = false;
-                    console.log('PaletteLive: Observer auto-sync resumed');
+                    PLLog.info(' Observer auto-sync resumed');
                 }
             }
 
             if (observerPaused) return;
 
-            const hasStructureChanges = mutations.some(mutation => mutation.addedNodes.length > 0 || mutation.removedNodes.length > 0);
-            const hasAttributeChanges = mutations.some(mutation => mutation.type === 'attributes');
+            const hasStructureChanges = mutations.some(
+                (mutation) => mutation.addedNodes.length > 0 || mutation.removedNodes.length > 0
+            );
+            const hasAttributeChanges = mutations.some((mutation) => mutation.type === 'attributes');
 
             if (!hasStructureChanges && !hasAttributeChanges) return;
 
             // Check if attribute changes are ONLY from our own highlights or styles
             // This is a backup check in case performDOMChange wasn't used
             if (hasAttributeChanges && !hasStructureChanges) {
-                const innerMutations = mutations.every(m => {
+                const innerMutations = mutations.every((m) => {
                     // Ignore mutations to our own elements
-                    if (m.target.id && (m.target.id.startsWith('palettelive') || m.target.id.startsWith('pl-'))) return true;
+                    if (m.target.id && (m.target.id.startsWith('palettelive') || m.target.id.startsWith('pl-')))
+                        return true;
                     // We can't easily distinguish style changes on elements, so we rely on debouncing
                     return false;
                 });
@@ -2547,15 +3344,15 @@
             observerRescanCount++;
             if (observerRescanCount > OBSERVER_MAX_RESCANS_PER_MINUTE) {
                 observerPaused = true;
-                console.warn('PaletteLive: High DOM activity detected. Auto-sync paused for 60s.');
+                PLLog.debug('PaletteLive: High DOM activity detected. Auto-sync paused for 60s.');
                 return;
             }
 
             if (hasStructureChanges) {
                 // Incremental: process only newly added nodes
                 const addedNodes = [];
-                mutations.forEach(mutation => {
-                    mutation.addedNodes.forEach(node => {
+                mutations.forEach((mutation) => {
+                    mutation.addedNodes.forEach((node) => {
                         if (node.nodeType === 1) addedNodes.push(node);
                     });
                 });
@@ -2573,12 +3370,12 @@
                             // happening while the cooldown is active).  Contrast
                             // enforcement only sets 'color' — never unsafe overrides.
                             if (_lastPaletteHexes && _lastPaletteHexes.length) {
-                                addedNodes.forEach(node => enforceTextContrast(_lastPaletteHexes, node));
+                                addedNodes.forEach((node) => enforceTextContrast(_lastPaletteHexes, node));
                             }
                             return;
                         }
-                        addedNodes.forEach(node => processAddedSubtree(node));
-                    }, 200);
+                        addedNodes.forEach((node) => processAddedSubtree(node));
+                    }, PLConfig.OBSERVER_DEBOUNCE_SMALL_MS);
                 } else if (addedNodes.length > 50) {
                     // Large batch: full rebuild (400ms debounce, includes reapplyAllOverrides)
                     clearTimeout(rebuildTimer);
@@ -2592,9 +3389,9 @@
                             }
                             return;
                         }
-                        console.log('PaletteLive: DOM changed significantly, full rebuild');
+                        PLLog.info(' DOM changed significantly, full rebuild');
                         buildColorMap();
-                    }, 400);
+                    }, PLConfig.OBSERVER_DEBOUNCE_LARGE_MS);
                 }
             }
 
@@ -2613,7 +3410,7 @@
                         return;
                     }
                     buildColorMap();
-                }, 500);
+                }, PLConfig.OBSERVER_DEBOUNCE_ATTR_MS);
             }
         });
     }
@@ -2667,32 +3464,37 @@
     let _plScrollReapplyTimer = null;
     let _plLastScrollReapply = 0;
 
-    window.addEventListener('scroll', () => {
-        if (__plPaused) return;
-        if (isRescanning) return; // never compete with an in-flight rescan
-        if (_plBulkApplyCooldown) return; // suppress during post-apply cooldown
-        if (rawOverrideState.size === 0) return; // nothing to re-apply
+    window.addEventListener(
+        'scroll',
+        () => {
+            if (__plPaused) return;
+            if (isRescanning) return; // never compete with an in-flight rescan
+            if (_plBulkApplyCooldown) return; // suppress during post-apply cooldown
+            if (_plDropperActive) return; // dropper active — skip scroll reapply
+            if (rawOverrideState.size === 0) return; // nothing to re-apply
 
-        clearTimeout(_plScrollReapplyTimer);
-        _plScrollReapplyTimer = setTimeout(() => {
-            if (isRescanning) return; // double-check after debounce
-            const now = Date.now();
-            // Throttle to at most once per 1500ms
-            if (now - _plLastScrollReapply < 1500) return;
-            _plLastScrollReapply = now;
-            // Lightweight re-apply — only touches elements already in the map.
-            // Avoids the expensive full DOM walk that buildColorMap() does.
-            reapplyAllOverrides();
-        }, 500);
-    }, { passive: true });
+            clearTimeout(_plScrollReapplyTimer);
+            _plScrollReapplyTimer = setTimeout(() => {
+                if (isRescanning) return; // double-check after debounce
+                const now = Date.now();
+                // Throttle to at most once per 1500ms
+                if (now - _plLastScrollReapply < PLConfig.SCROLL_REAPPLY_THROTTLE_MS) return;
+                _plLastScrollReapply = now;
+                // Lightweight re-apply — only touches elements already in the map.
+                // Avoids the expensive full DOM walk that buildColorMap() does.
+                reapplyAllOverrides();
+            }, PLConfig.SCROLL_REAPPLY_DEBOUNCE_MS);
+        },
+        { passive: true }
+    );
 
     // ── Periodic Override Watchdog ─────────────────────────────────
     // Detects when the page silently reverts overrides (React reconciliation,
     // CSS animations, framework re-renders) and forces re-application.
     let _plWatchdogTimer = null;
     let _plWatchdogNoDriftCount = 0; // adaptive: count consecutive no-drift ticks
-    const _WATCHDOG_FAST_MS = 5000;  // default interval
-    const _WATCHDOG_SLOW_MS = 10000; // slow interval after 3 consecutive no-drift ticks
+    const _WATCHDOG_FAST_MS = PLConfig.WATCHDOG_FAST_MS;
+    const _WATCHDOG_SLOW_MS = PLConfig.WATCHDOG_SLOW_MS;
 
     function startOverrideWatchdog() {
         if (_plWatchdogTimer) return;
@@ -2702,10 +3504,16 @@
             if (__plPaused) return;
             if (isRescanning) return; // never compete with an in-flight rescan
             if (_plBulkApplyCooldown) return; // suppress during post-apply cooldown
+            if (_plDropperActive) {
+                // Dropper is running — skip this tick but reschedule so watchdog
+                // resumes automatically if _plSetDropperActive(false) is not called.
+                _plWatchdogTimer = setTimeout(_runWatchdogTick, _WATCHDOG_FAST_MS);
+                return;
+            }
             if (rawOverrideState.size === 0) return;
 
             let drifted = 0;
-            const sampleLimit = 100; // reduced from 200 to lower per-tick cost
+            const sampleLimit = PLConfig.WATCHDOG_SAMPLE_LIMIT;
             let checked = 0;
 
             rawOverrideState.forEach((currentHex, originalHex) => {
@@ -2730,20 +3538,23 @@
                             drifted++;
                         }
                         checked++;
-                    } catch (e) { /* ignore */ }
+                    } catch (e) {
+                        /* ignore */
+                    }
                 }
             });
 
             if (drifted > 0) {
                 _plWatchdogNoDriftCount = 0;
-                console.log(`PaletteLive Watchdog: ${drifted}/${checked} overrides drifted, re-applying...`);
+                PLLog.info(`Watchdog: ${drifted}/${checked} overrides drifted, re-applying...`);
                 reapplyAllOverrides();
             } else {
                 _plWatchdogNoDriftCount++;
             }
 
             // Adaptive interval: slow down after 3 consecutive no-drift ticks
-            const nextMs = _plWatchdogNoDriftCount >= 3 ? _WATCHDOG_SLOW_MS : _WATCHDOG_FAST_MS;
+            const nextMs =
+                _plWatchdogNoDriftCount >= PLConfig.WATCHDOG_SLOW_THRESHOLD ? _WATCHDOG_SLOW_MS : _WATCHDOG_FAST_MS;
             _plWatchdogTimer = setTimeout(_runWatchdogTick, nextMs);
         };
 
@@ -2757,49 +3568,110 @@
         }
     }
 
-    // Auto-apply saved palette on page load.
-    // Check if extension is paused for this domain first.
-    const domain = window.location.hostname;
+    // Extension is OFF by default on every page load / refresh.
+    // Saved palette data is preserved in storage but never auto-applied —
+    // the user must turn the extension on via the popup each session.
+    __plPaused = true;
+    PLLog.info(' Extension is off by default. Use the popup to enable.');
 
-    function __plStartBackgroundWork() {
-        startObserver();
-        startOverrideWatchdog();
-    }
+    // ── Auto-Resume After Reload ─────────────────────────────────
+    // Save the paused state before page unload so we can auto-resume if it was ON
+    window.addEventListener('beforeunload', () => {
+        try {
+            sessionStorage.setItem('__plWasActiveBeforeReload', __plPaused ? '0' : '1');
+        } catch (e) {
+            /* ignore sessionStorage errors */
+        }
+    });
 
-    if (window.StorageUtils && domain) {
-        // Check paused state first
-        const pausedKey = `palettelive_paused_${domain}`;
-        chrome.storage.local.get(pausedKey, (result) => {
-            if (result[pausedKey]) {
-                __plPaused = true;
-                console.log('PaletteLive: Extension is paused for', domain);
-                return; // Don't start observers or apply saved palette
-            }
+    // Check if extension was ON before the reload and auto-resume after page loads
+    function tryAutoResumeAfterReload() {
+        try {
+            const wasActive = sessionStorage.getItem('__plWasActiveBeforeReload');
 
-            // Not paused — proceed normally
-            window.StorageUtils.getPalette(domain)
-                .then(savedData => {
-                    if (savedData && savedData.overrides) {
-                        console.log('Applying saved palette for', domain);
-                        applySavedPalette(savedData);
-                    } else if (savedData && savedData.settings) {
-                        if (savedData.settings.scheme) {
-                            setColorScheme(savedData.settings.scheme);
-                        }
-                        if (savedData.settings.vision) {
-                            setVisionMode(savedData.settings.vision);
-                        }
+            if (wasActive === '1') {
+                // Mark un-paused IMMEDIATELY so any PING from the popup that arrives
+                // before the deferred DOM-work fires gets the correct state.
+                // (Previously this was set inside performResume after a 300 ms delay,
+                // causing the popup to see paused:true and show the extension as OFF.)
+                __plPaused = false;
+                PLLog.info(' Extension was active before reload, will auto-resume after page loads');
+
+                const performResume = () => {
+                    // Remove the flag now that we're resuming
+                    try {
+                        sessionStorage.removeItem('__plWasActiveBeforeReload');
+                    } catch (e) {
+                        /* ignore */
                     }
-                })
-                .catch(() => {
-                    // Ignore load failures.
-                });
 
-            __plStartBackgroundWork();
-        });
-    } else {
-        __plStartBackgroundWork();
+                    // __plPaused already set to false above; start observer + reapply palette.
+                    startObserver();
+
+                    // Re-apply saved palette if any
+                    const domain = window.location.hostname;
+                    if (window.StorageUtils && domain) {
+                        window.StorageUtils.getPalette(domain)
+                            .then((savedData) => {
+                                if (savedData && savedData.overrides) {
+                                    PLLog.info(' Auto-resuming with saved palette');
+                                    applySavedPalette(savedData);
+                                } else if (savedData && savedData.settings) {
+                                    if (savedData.settings.scheme) setColorScheme(savedData.settings.scheme);
+                                    if (savedData.settings.vision) setVisionMode(savedData.settings.vision);
+                                }
+                            })
+                            .catch(() => {
+                                /* ignore */
+                            });
+                    }
+
+                    PLLog.info(' Auto-resumed after page reload');
+                };
+
+                // If page is already fully loaded, start observer+palette work immediately
+                // (small delay for DOM stability; paused flag already cleared above).
+                if (document.readyState === 'complete') {
+                    setTimeout(performResume, 300);
+                } else if (document.readyState === 'interactive') {
+                    // DOM is ready but resources still loading — wait for full load
+                    window.addEventListener(
+                        'load',
+                        () => {
+                            setTimeout(performResume, 300);
+                        },
+                        { once: true }
+                    );
+                } else {
+                    // Still loading — wait for full load
+                    window.addEventListener(
+                        'DOMContentLoaded',
+                        () => {
+                            window.addEventListener(
+                                'load',
+                                () => {
+                                    setTimeout(performResume, 300);
+                                },
+                                { once: true }
+                            );
+                        },
+                        { once: true }
+                    );
+                }
+            } else {
+                // Extension was OFF or no state saved — remove any stale flag
+                try {
+                    sessionStorage.removeItem('__plWasActiveBeforeReload');
+                } catch (e) {
+                    /* ignore */
+                }
+            }
+        } catch (e) {
+            PLLog.warn(' Auto-resume error', e);
+        }
     }
+
+    tryAutoResumeAfterReload();
 
     // ── SPA Route Detection ──────────────────────────────────────
     // Hook into History API to detect client-side navigation (React Router, Vue Router, etc.)
@@ -2812,28 +3684,89 @@
         if (newUrl === _plLastUrl) return;
         _plLastUrl = newUrl;
 
+        // Invalidate scan cache — the page content has changed.
+        _scanCache = null;
+
         clearTimeout(_plRouteTimer);
         _plRouteTimer = setTimeout(() => {
-            console.log('PaletteLive: SPA route change detected, rebuilding color map');
+            PLLog.info(' SPA route change detected, rebuilding color map');
             buildColorMap();
-        }, 600);
+        }, PLConfig.SPA_ROUTE_DEBOUNCE_MS);
     }
 
-    // Intercept pushState / replaceState
-    const _origPushState = history.pushState;
-    const _origReplaceState = history.replaceState;
+    // Intercept pushState / replaceState — guarded against double-patching
+    // when the content script is re-injected (version upgrade or navigation).
+    // Store the active handler on history so a re-injection can update it
+    // without double-wrapping the original browser methods.
+    history._plOnRouteChange = onRouteChange;
 
-    history.pushState = function () {
-        _origPushState.apply(this, arguments);
-        onRouteChange();
-    };
+    if (!history._plPatched) {
+        const _origPushState = history.pushState;
+        const _origReplaceState = history.replaceState;
 
-    history.replaceState = function () {
-        _origReplaceState.apply(this, arguments);
-        onRouteChange();
-    };
+        history.pushState = function () {
+            _origPushState.apply(this, arguments);
+            history._plOnRouteChange();
+        };
 
-    window.addEventListener('popstate', onRouteChange);
+        history.replaceState = function () {
+            _origReplaceState.apply(this, arguments);
+            history._plOnRouteChange();
+        };
+
+        history._plPatched = true;
+    }
+
+    window.addEventListener('popstate', () => history._plOnRouteChange());
+
+    // ── BFCache (Back-Forward Cache) Restoration ─────────────────────
+    // YouTube and many SPAs use bfcache for instant back/forward navigation.
+    // When Chrome restores a page from bfcache:
+    //   • `pageshow` fires with event.persisted === true
+    //   • `load`, `DOMContentLoaded`, `beforeunload` do NOT fire
+    //   • All frozen timers (watchdog, safety timers) need to be restarted
+    //   • The dropper overlay is a full-screen div that may still cover the page
+    window.addEventListener('pageshow', (event) => {
+        if (!event.persisted) return; // Normal load is handled by tryAutoResumeAfterReload
+
+        PLLog.info(' BFCache restore detected — re-hydrating state');
+
+        // 1. Force-cancel any stuck dropper.
+        //    The overlay is position:fixed;inset:0;z-index:2147483646 — if it was active
+        //    when leaving the page it will still be in the restored DOM and cover everything,
+        //    creating the blank screen the user sees.
+        if (_plDropperActive) {
+            _plSetDropperActive(false);
+            if (window.Dropper) window.Dropper.cancel();
+        }
+        // Belt-and-suspenders: remove any orphaned overlay node even if state flag was reset
+        const orphanOverlay = document.getElementById('pl-dropper-overlay');
+        if (orphanOverlay) orphanOverlay.remove();
+
+        // 2. Invalidate scan cache — the frozen DOM snapshot may be out of date
+        _scanCache = null;
+
+        // 3. Track URL in case SPA navigated while page was in bfcache
+        const currentUrl = location.href;
+        if (currentUrl !== _plLastUrl) {
+            _plLastUrl = currentUrl;
+        }
+
+        // 4. If the extension is active, restart frozen timers and reapply overrides
+        if (!__plPaused) {
+            startObserver();
+            if (rawOverrideState.size > 0) {
+                // Short delay so the restored page JS finishes reinitialising its DOM
+                // before we paint our overrides back on top.
+                setTimeout(() => {
+                    reapplyAllOverrides();
+                    startOverrideWatchdog();
+                }, 300);
+            } else {
+                startOverrideWatchdog();
+            }
+        }
+    });
 
     // ── Multi-tab Sync ──────────────────────────────────────────
     // When another tab modifies storage for the same domain, sync overrides.
@@ -2848,7 +3781,7 @@
         if (!newData) {
             // Data was deleted — reset all overrides
             resetAllOverrides();
-            console.log('PaletteLive: multi-tab sync — overrides cleared by another tab');
+            PLLog.info(' multi-tab sync — overrides cleared by another tab');
             return;
         }
 
@@ -2874,7 +3807,7 @@
             }
         }
 
-        console.log('PaletteLive: multi-tab sync — overrides updated from another tab');
+        PLLog.info(' multi-tab sync — overrides updated from another tab');
     });
 
     // Patch Dropper to use secure event dispatching (prevents page-spoofed events)
@@ -2891,7 +3824,7 @@
         try {
             // Validate event is trusted and has correct secret
             if (!isValidDropperEvent(event)) {
-                console.warn('PaletteLive: rejected untrusted pl-dropper-override event');
+                PLLog.warn(' rejected untrusted pl-dropper-override event');
                 return;
             }
 
@@ -2907,7 +3840,7 @@
                 applyRawOverride({ original: originalHex, current: currentHex, targetElement: detail.targetElement });
             }
         } catch (error) {
-            console.warn('PaletteLive: dropper override error', error);
+            PLLog.warn(' dropper override error', error);
         }
     });
 
@@ -2915,7 +3848,7 @@
         try {
             // Validate event is trusted and has correct secret
             if (!isValidDropperEvent(event)) {
-                console.warn('PaletteLive: rejected untrusted pl-dropper-save event');
+                PLLog.warn(' rejected untrusted pl-dropper-save event');
                 return;
             }
 
@@ -2935,7 +3868,7 @@
             if (!window.StorageUtils || !currentDomain) return;
 
             window.StorageUtils.getPalette(currentDomain)
-                .then(data => {
+                .then((data) => {
                     const newData = data || {};
                     if (!newData.overrides) newData.overrides = {};
                     if (!newData.overrides.variables) newData.overrides.variables = {};
@@ -2952,27 +3885,17 @@
                     return window.StorageUtils.savePalette(currentDomain, newData);
                 })
                 .then(() => {
-                    console.log(`PaletteLive: Saved dropper override ${detail.original} -> ${detail.current}`);
+                    PLLog.info(`Saved dropper override ${detail.original} -> ${detail.current}`);
                 })
-                .catch(error => {
-                    console.warn('PaletteLive: dropper save error', error);
+                .catch((error) => {
+                    PLLog.warn(' dropper save error', error);
                 });
         } catch (error) {
-            console.warn('PaletteLive: dropper save error', error);
+            PLLog.warn(' dropper save error', error);
         }
     });
 
     // Mark content script as fully initialized
     window.__paletteLiveReady = true;
-    console.log('PaletteLive content script ready');
-
+    PLLog.info('Content script ready');
 })();
-
-
-
-
-
-
-
-
-
