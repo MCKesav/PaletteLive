@@ -3772,14 +3772,13 @@ document.addEventListener('DOMContentLoaded', () => {
         const parsed = parseImportText(text);
         const rawEntries = Object.entries(parsed.rawOverrides || {});
         const variableEntries = Object.entries(parsed.variableOverrides || {});
-        const unmatchedTokenColors = parsed.unmatchedTokenColors || [];
         const hasScheme = !!(parsed.settings && parsed.settings.scheme);
         const hasVision = !!(parsed.settings && parsed.settings.vision);
         const hasPaletteMode = !!(parsed.settings && parsed.settings.paletteMode);
         const hasApplyPaletteInput = !!(parsed.settings && typeof parsed.settings.applyPaletteInput === 'string' && parsed.settings.applyPaletteInput !== '');
         const hasClustering = !!(parsed.settings && parsed.settings.clustering && typeof parsed.settings.clustering === 'object');
 
-        if (!rawEntries.length && !variableEntries.length && !unmatchedTokenColors.length && !hasScheme && !hasVision && !hasPaletteMode && !hasApplyPaletteInput && !hasClustering) {
+        if (!rawEntries.length && !variableEntries.length && !hasScheme && !hasVision && !hasPaletteMode && !hasApplyPaletteInput && !hasClustering) {
             throw new Error('No compatible overrides found in this file');
         }
 
@@ -3798,8 +3797,8 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         // ── Phase 2: Collect additional raw overrides from unmatched variable entries ──
-        // Generated names like --color-XXXXXX → extract original hex → raw override.
-        // Other unmatched vars → fuzzy-match against scanned page colors by similarity.
+        // Generated names like --color-XXXXXX encode the original hex → safe exact match.
+        // All other unmatched variable names are skipped (no guessing).
         const generatedVarRe = /^--color-([0-9a-f]{6,8})$/i;
         const additionalRawMap = {}; // originalHex → currentHex
         const assignedSources = new Set(rawEntries.map(([o]) => o));
@@ -3808,55 +3807,22 @@ document.addEventListener('DOMContentLoaded', () => {
             if (matchedVariableNames.has(name)) return;
             const genMatch = name.match(generatedVarRe);
             if (genMatch) {
+                // Generated variable names encode the original hex directly — safe exact match.
                 const originalHex = '#' + genMatch[1].toLowerCase();
                 if (normalizeHex(value) !== originalHex && !assignedSources.has(originalHex)) {
                     additionalRawMap[originalHex] = value;
                     assignedSources.add(originalHex);
                 }
-                return;
             }
-            for (const color of currentColors) {
-                const source = normalizeHex(color.value);
-                if (assignedSources.has(source)) continue;
-                if (overrideState.has(source) && overrideState.get(source) === value) continue;
-                const effective = getEffectiveValueForSource(source);
-                if (effective !== value) {
-                    const srcRgb = ColorUtils.hexToRgb(source);
-                    const newRgb = ColorUtils.hexToRgb(normalizeHex(value));
-                    const dist = Math.sqrt(
-                        Math.pow(srcRgb.r - newRgb.r, 2) +
-                            Math.pow(srcRgb.g - newRgb.g, 2) +
-                            Math.pow(srcRgb.b - newRgb.b, 2)
-                    );
-                    if (dist < 60) {
-                        additionalRawMap[source] = value;
-                        assignedSources.add(source);
-                        break;
-                    }
-                }
-            }
+            // Non-generated unmatched variables are skipped — no distance-based guessing.
         });
 
-        // ── Phase 3: Collect unmatched token color overrides ──
-        const tokenRawMap = {}; // originalHex → currentHex
-        if (unmatchedTokenColors.length && currentColors.length) {
-            const usedSources = new Set([
-                ...rawEntries.map(([o]) => o),
-                ...Object.keys(additionalRawMap),
-                ...Array.from(overrideState.keys()),
-            ]);
-            const availableColors = currentColors
-                .map((c) => normalizeHex(c.value))
-                .filter((src) => !usedSources.has(src));
-            for (let i = 0; i < unmatchedTokenColors.length && i < availableColors.length; i++) {
-                const source = availableColors[i];
-                const newColor = unmatchedTokenColors[i];
-                if (source !== newColor) tokenRawMap[source] = newColor;
-            }
-        }
+        // ── Phase 3 (removed): positional token-colour mapping was unreliable.
+        //    Token colours without an explicit source field are now ignored.
+        //    Only exact raw-hex and exact CSS-variable matches are applied.
 
-        // ── Phase 4: Merge ALL raw overrides into one array ──
-        const allRawMap = { ...Object.fromEntries(rawEntries), ...additionalRawMap, ...tokenRawMap };
+        // ── Phase 4: Merge confirmed raw overrides into one map ──
+        const allRawMap = { ...Object.fromEntries(rawEntries), ...additionalRawMap };
         const allRawArray = Object.entries(allRawMap)
             .filter(([original, current]) => original !== current)
             .map(([original, current]) => ({ original, current }));
@@ -4050,6 +4016,33 @@ document.addEventListener('DOMContentLoaded', () => {
         return [...variableEntries, ...colorEntries];
     }
 
+    // ── Export helper: map format name → { output, ext } ─────────────────────
+    // Single source of truth — used by both clipboard and file-download paths.
+    function _exportFormatOutput(format, dataToExport) {
+        switch (format) {
+            case 'css':      return { output: ExporterUtils.toCSS(dataToExport),      ext: 'css'  };
+            case 'json':     return { output: ExporterUtils.toJSON(dataToExport),     ext: 'json' };
+            case 'tailwind': return { output: ExporterUtils.toTailwind(dataToExport), ext: 'js'   };
+            case 'cmyk':     return { output: ExporterUtils.toCMYK(dataToExport),     ext: 'txt'  };
+            case 'lab':      return { output: ExporterUtils.toLAB(dataToExport),      ext: 'txt'  };
+            case 'oklch':    return { output: ExporterUtils.toOKLCH(dataToExport),    ext: 'txt'  };
+            default:         return { output: '',                                      ext: 'txt'  };
+        }
+    }
+
+    // ── Export helper: trigger a browser file-download for text content. ─────
+    function _downloadText(content, filename) {
+        const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 100);
+    }
+
     exportBtn.addEventListener('click', (event) => {
         event.stopPropagation();
         renderExportHistoryMenu();
@@ -4129,52 +4122,10 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        if (fileFormat) {
-            const dataToExport = buildExportData();
-            if (!dataToExport.length) {
-                exportMenu.classList.remove('show');
-                return;
-            }
-
-            let output = '';
-            let ext = 'txt';
-            if (fileFormat === 'css') {
-                output = ExporterUtils.toCSS(dataToExport);
-                ext = 'css';
-            } else if (fileFormat === 'json') {
-                output = ExporterUtils.toJSON(dataToExport);
-                ext = 'json';
-            } else if (fileFormat === 'tailwind') {
-                output = ExporterUtils.toTailwind(dataToExport);
-                ext = 'js';
-            } else if (fileFormat === 'cmyk') {
-                output = ExporterUtils.toCMYK(dataToExport);
-                ext = 'txt';
-            } else if (fileFormat === 'lab') {
-                output = ExporterUtils.toLAB(dataToExport);
-                ext = 'txt';
-            } else if (fileFormat === 'oklch') {
-                output = ExporterUtils.toOKLCH(dataToExport);
-                ext = 'txt';
-            }
-
-            const blob = new Blob([output], { type: 'text/plain;charset=utf-8' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = `palette-${fileFormat}.${ext}`;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            setTimeout(() => URL.revokeObjectURL(url), 100);
-
-            recordExportHistory(fileFormat, output);
-            persistDomainData();
-            exportMenu.classList.remove('show');
-            return;
-        }
-
-        if (!format) return;
+        // ── All other formats: CSS, JSON, Tailwind, CMYK, LAB, OKLCH ─────────
+        // Single dispatch: file-download or clipboard, then record + persist.
+        const activeFormat = fileFormat || format;
+        if (!activeFormat) return;
 
         const dataToExport = buildExportData();
         if (!dataToExport.length) {
@@ -4182,28 +4133,26 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        let output = '';
-        if (format === 'css') output = ExporterUtils.toCSS(dataToExport);
-        else if (format === 'json') output = ExporterUtils.toJSON(dataToExport);
-        else if (format === 'tailwind') output = ExporterUtils.toTailwind(dataToExport);
-        else if (format === 'cmyk') output = ExporterUtils.toCMYK(dataToExport);
-        else if (format === 'lab') output = ExporterUtils.toLAB(dataToExport);
-        else if (format === 'oklch') output = ExporterUtils.toOKLCH(dataToExport);
+        const { output, ext } = _exportFormatOutput(activeFormat, dataToExport);
+        if (!output) {
+            exportMenu.classList.remove('show');
+            return;
+        }
 
-        navigator.clipboard
-            .writeText(output)
-            .then(() => {
+        if (fileFormat) {
+            _downloadText(output, `palette-${fileFormat}.${ext}`);
+        } else {
+            try {
+                await navigator.clipboard.writeText(output);
                 const originalText = button.textContent;
                 button.textContent = 'Copied!';
-                setTimeout(() => {
-                    button.textContent = originalText;
-                }, 1500);
-            })
-            .catch((error) => {
+                setTimeout(() => { button.textContent = originalText; }, 1500);
+            } catch (error) {
                 console.warn('Clipboard write error:', error);
-            });
+            }
+        }
 
-        recordExportHistory(format, output);
+        recordExportHistory(activeFormat, output);
         persistDomainData();
         exportMenu.classList.remove('show');
     });
