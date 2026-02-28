@@ -199,5 +199,8 @@ if (typeof globalThis._colorNamesVersion !== 'undefined' && globalThis._colorNam
     };
 
     if (typeof module !== 'undefined') module.exports = ColorNames;
-    else globalThis.ColorNames = ColorNames;
+    else {
+        Object.freeze(ColorNames);
+        globalThis.ColorNames = ColorNames;
+    }
 } // end re-injection guard

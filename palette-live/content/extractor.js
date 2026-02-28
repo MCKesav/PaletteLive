@@ -26,6 +26,7 @@ if (window._extractorVersion === _EXTRACTOR_VERSION) {
          */
         scan: async () => {
             if (!window.ColorUtils) return { colors: [], variables: [] };
+            const _scanStartTime = performance.now();
             const elements = window.ShadowWalker ? window.ShadowWalker.getAllElements() : (document.body ? [document.body] : [document.documentElement]);
 
             // Ensure <html> (documentElement) is included — ShadowWalker starts
@@ -479,10 +480,25 @@ if (window._extractorVersion === _EXTRACTOR_VERSION) {
                 .sort((a, b) => b.usageCount - a.usageCount);
 
             console.debug(`PaletteLive: Found ${colors.length} colors, ${variables.length} variables`);
+            const _scanDuration = Math.round(performance.now() - _scanStartTime);
+            const totalElements = elements.length;
+            const wasCapped = elements.length > ELEMENT_LIMIT;
+            if (wasCapped) {
+                console.warn(`PaletteLive: Large DOM detected (${totalElements} elements). Scan was capped at ${ELEMENT_LIMIT} elements. Some colors may not be captured.`);
+            }
+            if (_scanDuration > 3000) {
+                console.warn(`PaletteLive: Scan took ${_scanDuration}ms. Consider using a lighter page or closing unnecessary tabs.`);
+            }
             return {
                 colors,
                 variables,
                 closedShadowCount: window.ShadowWalker ? window.ShadowWalker.closedShadowCount : 0,
+                _meta: {
+                    totalElements,
+                    scannedElements: Math.min(totalElements, ELEMENT_LIMIT),
+                    wasCapped,
+                    scanDurationMs: _scanDuration,
+                },
             };
         },
 
@@ -1209,5 +1225,9 @@ if (window._extractorVersion === _EXTRACTOR_VERSION) {
         },
     };
 
+    // Freeze to prevent page scripts from monkey-patching
+    Object.freeze(Extractor._colorProps);
+    Object.freeze(Extractor._voidTags);
+    Object.freeze(Extractor);
     window.Extractor = Extractor;
 } // end re-injection guard

@@ -97,6 +97,29 @@ body {
     color: var(--primary);
 }
 
+.logo-sep {
+    color: var(--fg-muted);
+    font-weight: 400;
+    font-size: 13px;
+    opacity: 0.5;
+    user-select: none;
+}
+
+.support-link {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--fg-muted);
+    text-decoration: none;
+    letter-spacing: 0.01em;
+    white-space: nowrap;
+    transition: color 0.15s;
+}
+
+.support-link:hover {
+    color: var(--primary);
+    text-decoration: underline;
+}
+
 .logo-img {
     width: 24px;
     height: 24px;
@@ -170,7 +193,11 @@ body {
 .header-actions {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 4px;
+}
+
+.header-actions .icon-btn {
+    padding: 4px 5px;
 }
 
 .icon-btn {
@@ -1059,9 +1086,21 @@ main {
     line-height: 1.4;
 }
 
+.apply-palette-input[readonly] {
+    background: var(--surface2, #f1f5f9);
+    color: var(--fg-muted, #64748b);
+    cursor: default;
+    resize: none;
+}
+
 .apply-palette-input:focus {
     border-color: var(--primary);
     box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.15);
+}
+
+.apply-palette-input[readonly]:focus {
+    border-color: var(--border);
+    box-shadow: none;
 }
 
 .apply-palette-preview {

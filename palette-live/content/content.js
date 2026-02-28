@@ -106,6 +106,10 @@
     let isRescanning = false;
     const pendingOverrides = [];
 
+    // Scan-in-progress guard — prevents concurrent Extractor.scan() calls
+    // (e.g. when the user spams the popup open/close or rescan button).
+    let _scanInProgress = false;
+
     // ── Scan result cache ──────────────────────────────────────────
     // Caches the last Extractor.scan() result in memory so reopening the
     // popup on the same page is instant (no DOM re-walk).
@@ -449,10 +453,48 @@
         return totalApplied;
     }
 
+    /**
+     * Validate incoming message structure. Ensures request is an object with a
+     * string type and optional payload of the expected shape. Prevents corrupted
+     * or malicious payloads from modifying DOM state.
+     */
+    function _validateMessagePayload(request) {
+        if (!request || typeof request !== 'object') return false;
+        if (typeof request.type !== 'string') return false;
+        // If a payload exists, it must be a plain object
+        if (request.payload !== undefined && (typeof request.payload !== 'object' || request.payload === null || Array.isArray(request.payload))) {
+            // Allow payload to be absent for many message types
+            // Only reject array payloads (object is expected)
+            if (Array.isArray(request.payload)) return false;
+        }
+        // Validate payload sub-fields for override messages
+        if (request.type === 'APPLY_OVERRIDE' || request.type === 'APPLY_OVERRIDE_FAST') {
+            const p = request.payload;
+            if (p) {
+                if (p.raw !== undefined && typeof p.raw !== 'object') return false;
+                if (p.variables !== undefined && typeof p.variables !== 'object') return false;
+            }
+        }
+        if (request.type === 'APPLY_OVERRIDE_BULK') {
+            const p = request.payload;
+            if (p) {
+                if (p.raw !== undefined && !Array.isArray(p.raw)) return false;
+                if (p.variables !== undefined && typeof p.variables !== 'object') return false;
+            }
+        }
+        return true;
+    }
+
     chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         // If context is invalidated, reject all messages
         if (_plContextInvalidated) {
             sendResponse({ success: false, error: 'Extension context invalidated. Please refresh the page.' });
+            return false;
+        }
+        // Deep payload validation — reject malformed messages early
+        if (!_validateMessagePayload(request)) {
+            PLLog.warn('Rejected malformed message:', request && request.type);
+            sendResponse({ success: false, error: 'Invalid message payload' });
             return false;
         }
         try {
@@ -565,8 +607,16 @@
                 }
 
                 // ── Slow path: full DOM scan ───────────────────────────
+                // Guard against concurrent scans (user spamming rescan)
+                if (_scanInProgress) {
+                    PLLog.debug('PaletteLive: Scan already in progress, waiting...');
+                    sendResponse({ success: false, error: 'Scan already in progress. Please wait.' });
+                    return false;
+                }
+                _scanInProgress = true;
                 window.Extractor.scan()
                     .then((data) => {
+                        _scanInProgress = false;
                         // Cache the result for subsequent popup opens on this URL.
                         _scanCache = { url: location.href, data, ts: Date.now() };
                         // Respond to the popup immediately with the scanned colors.
@@ -582,6 +632,7 @@
                         }
                     })
                     .catch((error) => {
+                        _scanInProgress = false;
                         PLLog.error(' Extraction failed:', error);
                         sendResponse({ success: false, error: error.message || 'Extraction failed' });
                     });
@@ -857,20 +908,6 @@
                 } catch (error) {
                     sendResponse({ success: false, error: error.message });
                 }
-                return;
-            }
-
-            if (request.type === 'TOGGLE_HEATMAP') {
-                if (isRescanning) {
-                    sendResponse({ success: false, error: 'Rescan in progress, try again' });
-                    return;
-                }
-                if (!window.Heatmap) {
-                    sendResponse({ success: false, error: 'Heatmap not available' });
-                    return;
-                }
-                window.Heatmap.toggle(!!(request.payload && request.payload.active));
-                sendResponse({ success: true });
                 return;
             }
 
@@ -3049,12 +3086,7 @@
         comparisonSnapshot = {
             raw: Array.from(rawOverrideState.entries()).map(([original, current]) => ({ original, current })),
             injectorState,
-            heatmapActive: !!(window.Heatmap && window.Heatmap.isActive),
         };
-
-        if (comparisonSnapshot.heatmapActive && window.Heatmap) {
-            window.Heatmap.toggle(false);
-        }
 
         // Pause the observer and watchdog during comparison to prevent them from
         // rebuilding the color map or re-applying overrides before the 'before'
@@ -3096,10 +3128,6 @@
             if (validEntries.length > 0) {
                 applyBulkRawOverrides(validEntries.map((e) => ({ original: e.original, current: e.current })));
             }
-        }
-
-        if (snapshot.heatmapActive && window.Heatmap) {
-            window.Heatmap.toggle(true);
         }
 
         buildColorMap();

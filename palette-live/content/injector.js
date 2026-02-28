@@ -48,14 +48,26 @@
 
         /**
          * Sanitize a CSS value to prevent injection.
-         * Strips characters that could break out of a CSS declaration.
+         * Strips characters that could break out of a CSS declaration and
+         * blocks dangerous CSS constructs like url(javascript:), expression(),
+         * -moz-binding, and var() injection chains.
          */
         _sanitizeCSSValue: (value) => {
             if (typeof value !== 'string') return null;
             // Remove characters that could escape the CSS context
             // Block: { } ; < > " \n \r ( ) ' ` and backslash-based escape sequences
             const safe = value.replace(/[{}<>;"\\\n\r()'\`]/g, '').trim();
-            return safe ? safe : null;
+            if (!safe) return null;
+            // Block dangerous CSS constructs (case-insensitive)
+            const lower = safe.toLowerCase();
+            if (lower.includes('url') ||
+                lower.includes('expression') ||
+                lower.includes('-moz-binding') ||
+                lower.includes('behavior') ||
+                lower.includes('javascript') ||
+                lower.includes('@import') ||
+                lower.includes('\\')) return null;
+            return safe;
         },
 
         /**

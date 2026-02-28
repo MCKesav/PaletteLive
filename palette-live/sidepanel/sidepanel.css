@@ -50,6 +50,25 @@ body {
     font-weight: 600;
     font-size: 14px;
     color: var(--accent);
+    width: 100%;
+}
+
+.editor-support-link {
+    font-size: 9.5px;
+    font-weight: 500;
+    color: #9ca3af;
+    text-decoration: none;
+    letter-spacing: 0.01em;
+    white-space: nowrap;
+    margin-left: auto;
+    opacity: 0.85;
+    transition: color 0.15s, opacity 0.15s;
+}
+
+.editor-support-link:hover {
+    color: #6366f1;
+    opacity: 1;
+    text-decoration: underline;
 }
 
 .panel-title .logo-img {

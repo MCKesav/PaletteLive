@@ -55,7 +55,6 @@ describe('Constants', () => {
                 'RESET_AND_RESCAN',
                 'RESCAN_ONLY',
                 'FORCE_REAPPLY',
-                'TOGGLE_HEATMAP',
                 'HIGHLIGHT_ELEMENTS',
                 'UNHIGHLIGHT',
                 'SET_COLOR_SCHEME',
@@ -78,6 +77,7 @@ describe('Constants', () => {
         test('contains all required message types used in background.js', () => {
             const required = [
                 'OPEN_EDITOR_WINDOW',
+                'OPEN_HEATMAP_WINDOW',
                 'DROPPER_RESOLVE_CLUSTER',
                 'SIDEPANEL_COLOR_CHANGED',
                 'SIDEPANEL_COLOR_COMMITTED',

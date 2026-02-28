@@ -474,5 +474,8 @@ if (typeof globalThis._colorUtilsVersion !== 'undefined' && globalThis._colorUti
 
     // Export
     if (typeof module !== 'undefined') module.exports = ColorUtils;
-    else globalThis.ColorUtils = ColorUtils;
+    else {
+        Object.freeze(ColorUtils);
+        globalThis.ColorUtils = ColorUtils;
+    }
 } // end re-injection guard

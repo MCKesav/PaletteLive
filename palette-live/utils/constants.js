@@ -45,7 +45,7 @@ if (typeof globalThis._constantsVersion !== 'undefined' && globalThis._constants
         DROPPER_RESOLVE_CLUSTER: 'DROPPER_RESOLVE_CLUSTER',
 
         // ── Heatmap ──
-        TOGGLE_HEATMAP: 'TOGGLE_HEATMAP',
+        OPEN_HEATMAP_WINDOW: 'OPEN_HEATMAP_WINDOW',
 
         // ── Text Contrast ──
         FIX_TEXT_CONTRAST: 'FIX_TEXT_CONTRAST',

@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Color Frequency - PaletteLive</title>
+    <link rel="stylesheet" href="heatmap.css">
+    <script src="../utils/colorNames.js"></script>
+</head>
+<body>
+    <div class="header">
+        <h1>Color Frequency Analysis</h1>
+        <button id="refresh-btn" title="Refresh analysis">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                <path d="M14 8C14 11.3137 11.3137 14 8 14C4.68629 14 2 11.3137 2 8C2 4.68629 4.68629 2 8 2C9.84861 2 11.5 2.87 12.5 4.25" stroke="currentColor" stroke-width="1.5"/>
+                <path d="M12 1L12 5L8 5" stroke="currentColor" stroke-width="1.5"/>
+            </svg>
+            Refresh
+        </button>
+    </div>
+
+    <div class="stats">
+        <div class="stat-card">
+            <span class="stat-label">Total Colors</span>
+            <span class="stat-value" id="total-colors">-</span>
+        </div>
+        <div class="stat-card">
+            <span class="stat-label">Total Elements</span>
+            <span class="stat-value" id="total-elements">-</span>
+        </div>
+        <div class="stat-card">
+            <span class="stat-label">Most Used</span>
+            <div class="most-used" id="most-used">
+                <span class="color-preview"></span>
+                <span class="color-hex">-</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="controls">
+        <label for="sort-select">Sort by:</label>
+        <select id="sort-select">
+            <option value="frequency">Frequency (High to Low)</option>
+            <option value="frequency-asc">Frequency (Low to High)</option>
+            <option value="color">Color (Hue)</option>
+        </select>
+        
+        <label for="filter-input">Filter:</label>
+        <input type="text" id="filter-input" placeholder="Search by hex or name...">
+    </div>
+
+    <div class="chart-container">
+        <canvas id="frequency-chart"></canvas>
+    </div>
+
+    <div class="color-list" id="color-list">
+        <!-- Color items will be populated here -->
+    </div>
+
+    <div class="loading" id="loading">
+        <div class="spinner"></div>
+        <p>Analyzing colors...</p>
+    </div>
+
+    <div class="error" id="error">
+        <p id="error-message">Failed to load color data</p>
+        <button id="retry-btn">Retry</button>
+    </div>
+
+    <script src="heatmap.js"></script>
+</body>
+</html>

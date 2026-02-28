@@ -3,7 +3,7 @@
     "name": "PaletteLive",
     "version": "1.0.0",
     "description": "Extract, edit, and export color palettes from any website live.",
-    "permissions": ["activeTab", "scripting", "storage", "sidePanel"],
+    "permissions": ["activeTab", "scripting", "storage"],
     "host_permissions": ["<all_urls>"],
     "action": {
         "default_popup": "popup/popup.html",
@@ -16,9 +16,6 @@
     },
     "content_security_policy": {
         "extension_pages": "script-src 'self'; object-src 'self'; style-src 'self' 'unsafe-inline'"
-    },
-    "side_panel": {
-        "default_path": "sidepanel/sidepanel.html"
     },
     "background": {
         "service_worker": "background.js"
@@ -35,7 +32,6 @@
                 "content/shadowWalker.js",
                 "content/extractor.js",
                 "content/injector.js",
-                "content/heatmap.js",
                 "content/dropper.js",
                 "content/content.js"
             ],

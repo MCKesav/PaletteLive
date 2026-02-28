@@ -23,9 +23,10 @@ function getDomainFromUrl(url) {
 // Message relay between popup, editor window, and content scripts
 // Persisted via chrome.storage.session to survive service worker restarts.
 let activeEditorWindowId = null;
+let activeHeatmapWindowId = null;
 
 // Restore state on service worker wake-up
-chrome.storage.session.get('activeEditorWindowId', (result) => {
+chrome.storage.session.get(['activeEditorWindowId', 'activeHeatmapWindowId'], (result) => {
     if (result && result.activeEditorWindowId != null) {
         // Verify the window still exists before trusting the stored value
         chrome.windows.get(result.activeEditorWindowId, (win) => {
@@ -39,6 +40,17 @@ chrome.storage.session.get('activeEditorWindowId', (result) => {
             }
         });
     }
+    if (result && result.activeHeatmapWindowId != null) {
+        chrome.windows.get(result.activeHeatmapWindowId, (win) => {
+            if (!chrome.runtime.lastError && win) {
+                if (activeHeatmapWindowId == null || activeHeatmapWindowId === result.activeHeatmapWindowId) {
+                    activeHeatmapWindowId = result.activeHeatmapWindowId;
+                }
+            } else {
+                chrome.storage.session.remove('activeHeatmapWindowId');
+            }
+        });
+    }
 });
 
 function _persistEditorWindowId(id) {
@@ -47,6 +59,15 @@ function _persistEditorWindowId(id) {
         chrome.storage.session.set({ activeEditorWindowId: id });
     } else {
         chrome.storage.session.remove('activeEditorWindowId');
+    }
+}
+
+function _persistHeatmapWindowId(id) {
+    activeHeatmapWindowId = id;
+    if (id != null) {
+        chrome.storage.session.set({ activeHeatmapWindowId: id });
+    } else {
+        chrome.storage.session.remove('activeHeatmapWindowId');
     }
 }
 
@@ -67,10 +88,34 @@ function createEditorWindow() {
     );
 }
 
+function createHeatmapWindow() {
+    chrome.windows.create(
+        {
+            url: chrome.runtime.getURL('heatmap/heatmap.html'),
+            type: 'popup',
+            width: 700,
+            height: 700,
+            focused: true,
+        },
+        (win) => {
+            if (chrome.runtime.lastError) {
+                console.error('PaletteLive: Failed to create heatmap window', chrome.runtime.lastError);
+                return;
+            }
+            if (win) {
+                _persistHeatmapWindowId(win.id);
+            }
+        }
+    );
+}
+
 // Track window closure
 chrome.windows.onRemoved.addListener((windowId) => {
     if (windowId === activeEditorWindowId) {
         _persistEditorWindowId(null);
+    }
+    if (windowId === activeHeatmapWindowId) {
+        _persistHeatmapWindowId(null);
     }
 });
 
@@ -101,6 +146,36 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 });
             } else {
                 createEditorWindow();
+            }
+        });
+        return true;
+    }
+
+    // Heatmap window is opened from popup.js
+    // Palette data is passed via session storage — no extra DOM walk needed
+    if (message.type === 'OPEN_HEATMAP_WINDOW') {
+        const payload = message.payload || {};
+
+        // Store palette data + tab ID so the heatmap window can read it
+        const sessionData = {};
+        if (payload.tabId) sessionData.palettelive_heatmapTabId = payload.tabId;
+        if (payload.colors) sessionData.palettelive_heatmapData = payload.colors;
+
+        chrome.storage.session.set(sessionData, () => {
+            if (chrome.runtime.lastError) {
+                console.error('PaletteLive: session.set failed', chrome.runtime.lastError);
+            }
+            // Check if window already exists
+            if (activeHeatmapWindowId !== null) {
+                chrome.windows.get(activeHeatmapWindowId, (win) => {
+                    if (chrome.runtime.lastError || !win) {
+                        createHeatmapWindow();
+                    } else {
+                        chrome.windows.update(activeHeatmapWindowId, { focused: true });
+                    }
+                });
+            } else {
+                createHeatmapWindow();
             }
         });
         return true;

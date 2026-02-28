@@ -20,6 +20,13 @@ if (window._shadowWalkerVersion === _SHADOW_WALKER_VERSION) {
         // Maximum total elements collected by getAllElements to prevent OOM
         MAX_ELEMENTS: 50000,
 
+        // Non-visual element tags that never carry rendered color — skipping them
+        // avoids unnecessary getComputedStyle calls downstream.
+        _NON_VISUAL_TAGS: new Set([
+            'SCRIPT', 'STYLE', 'META', 'LINK', 'NOSCRIPT', 'TEMPLATE',
+            'HEAD', 'TITLE', 'BASE', 'BR', 'WBR',
+        ]),
+
         /**
          * Traverse all nodes including those in open Shadow roots
          * @param {Node} root - Starting node (usually document.body)
@@ -43,6 +50,11 @@ if (window._shadowWalkerVersion === _SHADOW_WALKER_VERSION) {
 
             let node = walker.nextNode();
             while (node) {
+                // Skip non-visual elements — they never carry rendered color
+                if (ShadowWalker._NON_VISUAL_TAGS.has(node.tagName)) {
+                    node = walker.nextNode();
+                    continue;
+                }
                 if (callback(node) === false) return false;
 
                 // Check for Shadow Root
@@ -93,5 +105,12 @@ if (window._shadowWalkerVersion === _SHADOW_WALKER_VERSION) {
         },
     };
 
+    // Lock methods & constants to prevent monkey-patching, but keep
+    // closedShadowCount and MAX_ELEMENTS writable (they mutate at runtime).
+    Object.freeze(ShadowWalker._NON_VISUAL_TAGS);
+    ['walk', 'getAllElements', '_NON_VISUAL_TAGS', 'MAX_SHADOW_DEPTH'].forEach((key) => {
+        Object.defineProperty(ShadowWalker, key, { writable: false, configurable: false });
+    });
+    Object.seal(ShadowWalker); // prevent adding new properties
     window.ShadowWalker = ShadowWalker;
 } // end re-injection guard

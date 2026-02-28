@@ -42,6 +42,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const applyPaletteStatus = document.getElementById('apply-palette-status');
     const hintAuto = document.getElementById('apply-palette-hint-auto');
     const hintManual = document.getElementById('apply-palette-hint-manual');
+    const applyPalettePresets = document.querySelector('.apply-palette-presets');
     const clusterToggle = document.getElementById('cluster-toggle');
     const clusterThreshold = document.getElementById('cluster-threshold');
     const clusterThresholdValue = document.getElementById('cluster-threshold-value');
@@ -1257,8 +1258,13 @@ document.addEventListener('DOMContentLoaded', () => {
             document
                 .querySelectorAll('.mapping-mode-tab')
                 .forEach((t) => t.classList.toggle('active', t.dataset.mode === _paletteMappingMode));
-            hintAuto.classList.toggle('hidden', _paletteMappingMode !== 'auto');
-            hintManual.classList.toggle('hidden', _paletteMappingMode !== 'manual');
+            // Only show hints in apply-palette mode; generator mode hides them
+            const isGeneratorMode = [
+                'monochromatic', '60-30-10', 'analogous',
+                'complementary', 'split-complementary', 'triadic',
+            ].includes(paletteModeSelect.value);
+            hintAuto.classList.toggle('hidden', isGeneratorMode || _paletteMappingMode !== 'auto');
+            hintManual.classList.toggle('hidden', isGeneratorMode || _paletteMappingMode !== 'manual');
             // Re-render preview with new mode
             const hexes = parseApplyPaletteInput(applyPaletteInput.value);
             if (hexes.length) renderApplyPreview(hexes);
@@ -2194,6 +2200,19 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         }
 
+        // In generator modes: hide the "paste hex" hints (generator fills the palette),
+        // hide preset buttons (they would silently override generated colors),
+        // and make the textarea read-only so auto-populated values cannot be accidentally edited.
+        if (isGenerator) {
+            hintAuto.classList.add('hidden');
+            hintManual.classList.add('hidden');
+        } else {
+            hintAuto.classList.toggle('hidden', _paletteMappingMode !== 'auto');
+            hintManual.classList.toggle('hidden', _paletteMappingMode !== 'manual');
+        }
+        if (applyPalettePresets) applyPalettePresets.classList.toggle('hidden', isGenerator);
+        applyPaletteInput.readOnly = isGenerator;
+
         // Hide per-mode summary when switching; each renderer will set it
         paletteSummary.classList.add('hidden');
         paletteSummary.textContent = '';
@@ -2207,6 +2226,27 @@ document.addEventListener('DOMContentLoaded', () => {
         return ColorScience.hslToHex(h, s, l);
     }
 
+    /**
+     * Convert hex to OKLCH { L, C, H }.
+     * Delegates to ColorScience.hexToOklch.
+     */
+    function hexToOklch(hex) {
+        return ColorScience.hexToOklch(hex);
+    }
+
+    /**
+     * Convert OKLCH values to hex.
+     * Delegates to ColorScience.oklchToHex.
+     */
+    function oklchToHex(L, C, H) {
+        return ColorScience.oklchToHex(L, C, H);
+    }
+
+    /**
+     * Generate palette colors using OKLCH color space for perceptual uniformity.
+     * Rotating hue in OKLCH keeps perceived lightness constant, producing
+     * more aesthetically balanced palettes than HSL-based generation.
+     */
     function generateColors() {
         const mode = paletteModeSelect.value;
         let colors = [];
@@ -2214,21 +2254,23 @@ document.addEventListener('DOMContentLoaded', () => {
         if (mode === 'monochromatic') {
             const baseHex = String(genMonoColor.value || '#3b82f6').trim();
             const count = parseInt(genMonoCount.value || '5', 10);
-            const { h, s, l } = hexToHsl(baseHex);
-            // hexToHsl returns s and l in 0–1; hslToHex expects 0–100
-            const s100 = s * 100;
-            const l100 = l * 100;
+            const { L, C, H } = hexToOklch(baseHex);
 
             colors.push(baseHex);
 
-            // Generate variations
+            // Generate lightness variations keeping hue and chroma constant.
+            // OKLCH lightness ranges 0–1; we stay within 0.10–0.95 for usable colors.
             const steps = count - 1;
             if (steps > 0) {
-                const availableRange = l100 < 50 ? 95 - l100 : l100 - 5;
-                const step = Math.floor(availableRange / count);
+                const minL = 0.10;
+                const maxL = 0.95;
+                const availableRange = L < 0.5 ? maxL - L : L - minL;
+                const step = availableRange / count;
                 for (let i = 1; i <= steps; i++) {
-                    const lStep = l100 < 50 ? Math.min(l100 + i * step, 95) : Math.max(l100 - i * step, 5);
-                    colors.push(hslToHex(h, s100, lStep));
+                    const newL = L < 0.5
+                        ? Math.min(L + i * step, maxL)
+                        : Math.max(L - i * step, minL);
+                    colors.push(oklchToHex(newL, C, H));
                 }
             }
         } else if (mode === '60-30-10') {
@@ -2240,38 +2282,37 @@ document.addEventListener('DOMContentLoaded', () => {
         } else if (mode === 'analogous') {
             const baseHex = String(genAnalogColor.value || '#3b82f6').trim();
             const spread = parseInt(genAnalogSpread.value || '30', 10);
-            const { h, s, l } = hexToHsl(baseHex);
-            // hexToHsl returns s and l in 0–1; hslToHex expects 0–100
-            const s100 = s * 100;
-            const l100 = l * 100;
+            const { L, C, H } = hexToOklch(baseHex);
 
+            // Rotate hue in OKLCH space; L and C stay constant → perceptually uniform
             colors = [
-                hslToHex((h - spread + 360) % 360, s100, l100),
+                oklchToHex(L, C, (H - spread + 360) % 360),
                 baseHex,
-                hslToHex((h + spread) % 360, s100, l100),
+                oklchToHex(L, C, (H + spread) % 360),
             ];
         } else if (mode === 'complementary') {
             const baseHex = String(genCompBase.value || '#3b82f6').trim();
-            const { h, s, l } = hexToHsl(baseHex);
-            // hexToHsl returns s and l in 0–1; hslToHex expects 0–100
-            colors = [baseHex, hslToHex((h + 180) % 360, s * 100, l * 100)];
+            const { L, C, H } = hexToOklch(baseHex);
+
+            colors = [baseHex, oklchToHex(L, C, (H + 180) % 360)];
         } else if (mode === 'split-complementary') {
             const baseHex = String(genSplitColor.value || '#3b82f6').trim();
             const gap = parseInt(genSplitGap.value || '150', 10);
-            const { h, s, l } = hexToHsl(baseHex);
-            // hexToHsl returns s and l in 0–1; hslToHex expects 0–100
-            const s100 = s * 100;
-            const l100 = l * 100;
+            const { L, C, H } = hexToOklch(baseHex);
 
-            colors = [baseHex, hslToHex((h + gap) % 360, s100, l100), hslToHex((h + (360 - gap)) % 360, s100, l100)];
-        } else if (mode === 'triadic') {
-            const baseHex = String(genTriadicColor.value || '#3b82f6').trim();
-            const { h, s, l } = hexToHsl(baseHex);
-            // hexToHsl returns s and l in 0–1; hslToHex expects 0–100
             colors = [
                 baseHex,
-                hslToHex((h + 120) % 360, s * 100, l * 100),
-                hslToHex((h + 240) % 360, s * 100, l * 100),
+                oklchToHex(L, C, (H + gap) % 360),
+                oklchToHex(L, C, (H + (360 - gap)) % 360),
+            ];
+        } else if (mode === 'triadic') {
+            const baseHex = String(genTriadicColor.value || '#3b82f6').trim();
+            const { L, C, H } = hexToOklch(baseHex);
+
+            colors = [
+                baseHex,
+                oklchToHex(L, C, (H + 120) % 360),
+                oklchToHex(L, C, (H + 240) % 360),
             ];
         }
 
@@ -3116,7 +3157,6 @@ document.addEventListener('DOMContentLoaded', () => {
             'content/shadowWalker.js',
             'content/extractor.js',
             'content/injector.js',
-            'content/heatmap.js',
             'content/dropper.js',
             'content/content.js',
         ];
@@ -3583,6 +3623,50 @@ document.addEventListener('DOMContentLoaded', () => {
             variableOverrides[String(name)] = target;
         };
 
+        /**
+         * Validate PaletteLive native (.plp) schema.
+         * Returns true if the parsed object conforms to the expected structure.
+         * Rejects malformed data to prevent corrupted state.
+         */
+        function validatePlpSchema(obj) {
+            if (!obj || typeof obj !== 'object') return false;
+            // _palettelive version must be a string
+            if (typeof obj._palettelive !== 'string') return false;
+            // Supported versions
+            const supportedVersions = ['1.0'];
+            if (!supportedVersions.includes(obj._palettelive)) {
+                console.warn('PaletteLive: Unsupported .plp version:', obj._palettelive);
+                return false;
+            }
+            // overrides must be an object (if present)
+            if (obj.overrides !== undefined) {
+                if (typeof obj.overrides !== 'object' || obj.overrides === null) return false;
+                // overrides.raw must be a flat object of string→string (if present)
+                if (obj.overrides.raw !== undefined) {
+                    if (typeof obj.overrides.raw !== 'object' || obj.overrides.raw === null || Array.isArray(obj.overrides.raw)) return false;
+                    for (const [k, v] of Object.entries(obj.overrides.raw)) {
+                        if (typeof k !== 'string' || typeof v !== 'string') return false;
+                    }
+                }
+                // overrides.variables must be a flat object of string→string (if present)
+                if (obj.overrides.variables !== undefined) {
+                    if (typeof obj.overrides.variables !== 'object' || obj.overrides.variables === null || Array.isArray(obj.overrides.variables)) return false;
+                    for (const [k, v] of Object.entries(obj.overrides.variables)) {
+                        if (typeof k !== 'string' || !k.startsWith('--') || typeof v !== 'string') return false;
+                    }
+                }
+            }
+            // settings must be an object (if present)
+            if (obj.settings !== undefined) {
+                if (typeof obj.settings !== 'object' || obj.settings === null) return false;
+            }
+            // domain must be a string (if present)
+            if (obj.domain !== undefined && typeof obj.domain !== 'string') return false;
+            // timestamp must be a string (if present)
+            if (obj.timestamp !== undefined && typeof obj.timestamp !== 'string') return false;
+            return true;
+        }
+
         const trimmed = String(text || '').trim();
         if (!trimmed) return { rawOverrides, variableOverrides, settings };
 
@@ -3593,8 +3677,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
             if (parsed && typeof parsed === 'object') {
                 // ── PaletteLive Native format — lossless round-trip, apply directly ──
-                // Detected by _palettelive version field. No fuzzy matching needed.
+                // Detected by _palettelive version field. Validate schema before applying.
                 if (parsed._palettelive) {
+                    if (!validatePlpSchema(parsed)) {
+                        console.warn('PaletteLive: Invalid .plp file schema — ignoring import.');
+                        return { rawOverrides, variableOverrides, settings };
+                    }
                     if (parsed.overrides && typeof parsed.overrides.raw === 'object') {
                         Object.entries(parsed.overrides.raw).forEach(([original, current]) =>
                             assignRaw(original, current)
@@ -4273,20 +4361,40 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    heatmapToggle.addEventListener('change', (event) => {
-        if (!activeTabId) return;
-
-        // Persist state so popup reopens with the same toggle position.
-        chrome.storage.session.set({ palettelive_heatmap_active: event.target.checked });
-
-        sendMessageToTab({
-            type: 'TOGGLE_HEATMAP',
-            payload: { active: event.target.checked },
-        }).then((result) => {
-            if (!result.ok) {
-                console.warn('PaletteLive: Heatmap toggle failed', result.error);
+    heatmapToggle.addEventListener('click', () => {
+        try {
+            // Store current palette data in session so the heatmap window can read it
+            // without a redundant DOM walk. The popup already has all frequency data.
+            const colors = [];
+            for (let i = 0; i < currentColors.length; i++) {
+                const c = currentColors[i];
+                let name = c.value || '';
+                try {
+                    name = c._displayName || (window.ColorNames ? ColorNames.getName(c.value) : c.value) || c.value;
+                } catch (_) { /* keep hex as fallback */ }
+                colors.push({
+                    hex: c.value,
+                    frequency: c.count || 1,
+                    usage: c.categories || [c.primaryCategory || 'unknown'],
+                    name: name,
+                });
             }
-        });
+
+            const heatmapPayload = {
+                tabId: activeTabId,
+                colors: colors,
+            };
+
+            chrome.runtime.sendMessage(
+                { type: 'OPEN_HEATMAP_WINDOW', payload: heatmapPayload },
+                () => {
+                    // Ignore response — popup may close before background replies
+                    if (chrome.runtime.lastError) { /* expected if popup closes */ }
+                }
+            );
+        } catch (err) {
+            console.error('PaletteLive: Heatmap click error', err);
+        }
     });
 
     // Theme dropdown removed — color scheme always defaults to 'auto'
@@ -4542,10 +4650,9 @@ document.addEventListener('DOMContentLoaded', () => {
         updateUndoButton();
         // Explicitly clear session storage to avoid stale state on reopen
         baselineScreenshot = null;
-        chrome.storage.session.remove(['palettelive_historyStack', 'palettelive_redoStack', 'sidePanelColorData', 'palettelive_baselineScreenshot', 'palettelive_heatmap_active', 'palettelive_compare_active']);
+        chrome.storage.session.remove(['palettelive_historyStack', 'palettelive_redoStack', 'sidePanelColorData', 'palettelive_baselineScreenshot', 'palettelive_compare_active']);
         closeEditor();
 
-        heatmapToggle.checked = false;
         compareToggle.checked = false;
         comparisonActive = false;
         // schemeSelect removed — scheme defaults to 'auto'
@@ -4568,11 +4675,6 @@ document.addEventListener('DOMContentLoaded', () => {
         } catch (error) {
             console.warn('PaletteLive: Failed to clear saved palette', error);
         }
-
-        await sendMessageToTab({
-            type: 'TOGGLE_HEATMAP',
-            payload: { active: false },
-        });
 
         // Helper to send RESET_AND_RESCAN and get response (with 20s timeout)
         const resetAndRescan = () =>
@@ -4864,9 +4966,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 overrideState.clear();
                 baselineScreenshot = null;
                 comparisonActive = false;
-                heatmapToggle.checked = false;
                 compareToggle.checked = false;
-                chrome.storage.session.remove(['palettelive_baselineScreenshot', 'palettelive_heatmap_active', 'palettelive_compare_active']);
+                chrome.storage.session.remove(['palettelive_baselineScreenshot', 'palettelive_compare_active']);
                 renderClusterSummary(0, 0, 0);
                 paletteList.textContent = '';
                 const navDiv = document.createElement('div');
@@ -4949,17 +5050,12 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             const sessionData = await chrome.storage.session.get([
                 'palettelive_baselineScreenshot',
-                'palettelive_heatmap_active',
                 'palettelive_compare_active',
             ]);
             if (sessionData && sessionData.palettelive_baselineScreenshot) {
                 baselineScreenshot = sessionData.palettelive_baselineScreenshot;
             }
-            // Restore toggle states — the content script still has the overlay/
-            // heatmap active from before the popup was closed.
-            if (sessionData && sessionData.palettelive_heatmap_active === true) {
-                heatmapToggle.checked = true;
-            }
+            // Restore compare toggle state — the content script still has the overlay active.
             if (sessionData && sessionData.palettelive_compare_active === true) {
                 compareToggle.checked = true;
                 comparisonActive = true;

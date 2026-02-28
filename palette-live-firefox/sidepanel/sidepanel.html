@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>PaletteLive Editor</title>
+        <link rel="stylesheet" href="sidepanel.css" />
+    </head>
+
+    <body>
+        <div class="panel-container">
+            <header class="panel-header">
+                <div class="panel-title">
+                    <img src="../assets/logo.png" alt="" width="24" height="24" class="logo-img" />
+                    <span>PaletteLive Editor</span>
+                    <a href="https://palettelive.mckesav.in/supportdev" target="_blank" rel="noopener noreferrer"
+                        class="editor-support-link">Keep this project alive</a>
+                </div>
+            </header>
+
+            <div id="waiting-state" class="waiting-state">
+                <div class="waiting-icon">🎨</div>
+                <p>Click a color swatch in the popup to start editing</p>
+            </div>
+
+            <div id="editor-content" class="editor-content hidden">
+                <div class="color-display">
+                    <h3 id="selected-color-label">#000000</h3>
+                </div>
+
+                <div class="color-picker-container">
+                    <input type="color" id="color-picker" value="#000000" aria-label="Color Picker" />
+                </div>
+
+                <label class="realtime-toggle-row" for="realtime-toggle">
+                    <input type="checkbox" id="realtime-toggle" checked />
+                    Real-time preview
+                </label>
+
+                <div id="variable-info" class="variable-info hidden"></div>
+
+                <label class="export-select-row" for="export-select-toggle">
+                    <input type="checkbox" id="export-select-toggle" checked />
+                    Include this color in export
+                </label>
+
+                <button id="batch-apply-btn" class="btn secondary batch-apply-btn" type="button">
+                    Apply Color To Export Set
+                </button>
+
+                <div class="contrast-checker">
+                    <h4>Contrast Check</h4>
+                    <div class="contrast-result">
+                        <span id="contrast-ratio">4.50:1</span>
+                        <span id="contrast-rating" class="badge">AA</span>
+                    </div>
+                    <p class="contrast-context">Against selected target</p>
+                    <div class="wcag-grid">
+                        <div id="wcag-aa-normal" class="wcag-row">AA normal: Pass</div>
+                        <div id="wcag-aaa-normal" class="wcag-row">AAA normal: Fail</div>
+                        <div id="wcag-aa-large" class="wcag-row">AA large: Pass</div>
+                        <div id="wcag-aaa-large" class="wcag-row">AAA large: Pass</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <script src="../utils/constants.js"></script>
+        <script src="../utils/colorUtils.js"></script>
+        <script src="../utils/colorNames.js"></script>
+        <script src="../utils/contrast.js"></script>
+        <script src="sidepanel.js"></script>
+    </body>
+</html>

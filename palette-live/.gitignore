@@ -21,3 +21,6 @@ dist/
 *.crx
 *.pem
 *.zip
+
+# Local task tracking
+TODO.md

@@ -1,6 +1,6 @@
 /**
  * PaletteLive - Color Science Utilities
- * Shared CIELAB, CIEDE2000, and HSL conversion functions.
+ * Shared CIELAB, CIEDE2000, HSL, and OKLCH conversion functions.
  * Used by popup.js palette logic and potentially by any future module
  * that needs perceptual color distance or HSL conversion.
  */
@@ -183,6 +183,65 @@ if (typeof globalThis._colorScienceVersion !== 'undefined' && globalThis._colorS
                     .padStart(2, '0');
             };
             return `#${f(0)}${f(8)}${f(4)}`;
+        },
+
+        /**
+         * Convert a hex color to OKLCH (perceptually uniform).
+         * Returns { L: 0–1, C: ≥0, H: 0–360 }.
+         * @param {string} hex - e.g. '#3b82f6'
+         * @returns {{ L: number, C: number, H: number }}
+         */
+        hexToOklch(hex) {
+            const ColorUtils = globalThis.ColorUtils;
+            if (!ColorUtils || typeof ColorUtils.hexToRgb !== 'function') return { L: 0, C: 0, H: 0 };
+            const rgb = ColorUtils.hexToRgb(hex);
+            if (!rgb) return { L: 0, C: 0, H: 0 };
+
+            // sRGB → linear
+            const toLinear = (v) => {
+                const c = v / 255;
+                return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+            };
+            const rLin = toLinear(rgb.r);
+            const gLin = toLinear(rgb.g);
+            const bLin = toLinear(rgb.b);
+
+            // Linear sRGB → LMS
+            const l = 0.4122214708 * rLin + 0.5363325363 * gLin + 0.0514459929 * bLin;
+            const m = 0.2119034982 * rLin + 0.6806995451 * gLin + 0.1073969566 * bLin;
+            const s = 0.0883024619 * rLin + 0.2817188376 * gLin + 0.6299787005 * bLin;
+
+            // LMS → cube-root → OKLab
+            const l_ = Math.cbrt(l);
+            const m_ = Math.cbrt(m);
+            const s_ = Math.cbrt(s);
+
+            const L = 0.2104542553 * l_ + 0.793617785 * m_ - 0.0040720468 * s_;
+            const a = 1.9779984951 * l_ - 2.428592205 * m_ + 0.4505937099 * s_;
+            const b = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.808675766 * s_;
+
+            // OKLab → OKLCH
+            const C = Math.sqrt(a * a + b * b);
+            let H = (Math.atan2(b, a) * 180) / Math.PI;
+            if (H < 0) H += 360;
+
+            return { L, C, H };
+        },
+
+        /**
+         * Convert OKLCH values to hex string.
+         * @param {number} L - Lightness (0–1)
+         * @param {number} C - Chroma (≥0)
+         * @param {number} H - Hue (0–360)
+         * @returns {string} e.g. '#3b82f6'
+         */
+        oklchToHex(L, C, H) {
+            const ColorUtils = globalThis.ColorUtils;
+            if (!ColorUtils || typeof ColorUtils._oklabToHex !== 'function') return '#000000';
+            const hRad = (H * Math.PI) / 180;
+            const a = C * Math.cos(hRad);
+            const b = C * Math.sin(hRad);
+            return ColorUtils._oklabToHex(L, a, b);
         },
     };
 
