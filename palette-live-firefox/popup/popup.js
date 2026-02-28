@@ -1260,8 +1260,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 .forEach((t) => t.classList.toggle('active', t.dataset.mode === _paletteMappingMode));
             // Only show hints in apply-palette mode; generator mode hides them
             const isGeneratorMode = [
-                'monochromatic', '60-30-10', 'analogous',
-                'complementary', 'split-complementary', 'triadic',
+                'monochromatic',
+                '60-30-10',
+                'analogous',
+                'complementary',
+                'split-complementary',
+                'triadic',
             ].includes(paletteModeSelect.value);
             hintAuto.classList.toggle('hidden', isGeneratorMode || _paletteMappingMode !== 'auto');
             hintManual.classList.toggle('hidden', isGeneratorMode || _paletteMappingMode !== 'manual');
@@ -2262,14 +2266,12 @@ document.addEventListener('DOMContentLoaded', () => {
             // OKLCH lightness ranges 0–1; we stay within 0.10–0.95 for usable colors.
             const steps = count - 1;
             if (steps > 0) {
-                const minL = 0.10;
+                const minL = 0.1;
                 const maxL = 0.95;
                 const availableRange = L < 0.5 ? maxL - L : L - minL;
                 const step = availableRange / count;
                 for (let i = 1; i <= steps; i++) {
-                    const newL = L < 0.5
-                        ? Math.min(L + i * step, maxL)
-                        : Math.max(L - i * step, minL);
+                    const newL = L < 0.5 ? Math.min(L + i * step, maxL) : Math.max(L - i * step, minL);
                     colors.push(oklchToHex(newL, C, H));
                 }
             }
@@ -2285,11 +2287,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const { L, C, H } = hexToOklch(baseHex);
 
             // Rotate hue in OKLCH space; L and C stay constant → perceptually uniform
-            colors = [
-                oklchToHex(L, C, (H - spread + 360) % 360),
-                baseHex,
-                oklchToHex(L, C, (H + spread) % 360),
-            ];
+            colors = [oklchToHex(L, C, (H - spread + 360) % 360), baseHex, oklchToHex(L, C, (H + spread) % 360)];
         } else if (mode === 'complementary') {
             const baseHex = String(genCompBase.value || '#3b82f6').trim();
             const { L, C, H } = hexToOklch(baseHex);
@@ -2300,20 +2298,12 @@ document.addEventListener('DOMContentLoaded', () => {
             const gap = parseInt(genSplitGap.value || '150', 10);
             const { L, C, H } = hexToOklch(baseHex);
 
-            colors = [
-                baseHex,
-                oklchToHex(L, C, (H + gap) % 360),
-                oklchToHex(L, C, (H + (360 - gap)) % 360),
-            ];
+            colors = [baseHex, oklchToHex(L, C, (H + gap) % 360), oklchToHex(L, C, (H + (360 - gap)) % 360)];
         } else if (mode === 'triadic') {
             const baseHex = String(genTriadicColor.value || '#3b82f6').trim();
             const { L, C, H } = hexToOklch(baseHex);
 
-            colors = [
-                baseHex,
-                oklchToHex(L, C, (H + 120) % 360),
-                oklchToHex(L, C, (H + 240) % 360),
-            ];
+            colors = [baseHex, oklchToHex(L, C, (H + 120) % 360), oklchToHex(L, C, (H + 240) % 360)];
         }
 
         return colors;
@@ -3643,14 +3633,24 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (typeof obj.overrides !== 'object' || obj.overrides === null) return false;
                 // overrides.raw must be a flat object of string→string (if present)
                 if (obj.overrides.raw !== undefined) {
-                    if (typeof obj.overrides.raw !== 'object' || obj.overrides.raw === null || Array.isArray(obj.overrides.raw)) return false;
+                    if (
+                        typeof obj.overrides.raw !== 'object' ||
+                        obj.overrides.raw === null ||
+                        Array.isArray(obj.overrides.raw)
+                    )
+                        return false;
                     for (const [k, v] of Object.entries(obj.overrides.raw)) {
                         if (typeof k !== 'string' || typeof v !== 'string') return false;
                     }
                 }
                 // overrides.variables must be a flat object of string→string (if present)
                 if (obj.overrides.variables !== undefined) {
-                    if (typeof obj.overrides.variables !== 'object' || obj.overrides.variables === null || Array.isArray(obj.overrides.variables)) return false;
+                    if (
+                        typeof obj.overrides.variables !== 'object' ||
+                        obj.overrides.variables === null ||
+                        Array.isArray(obj.overrides.variables)
+                    )
+                        return false;
                     for (const [k, v] of Object.entries(obj.overrides.variables)) {
                         if (typeof k !== 'string' || !k.startsWith('--') || typeof v !== 'string') return false;
                     }
@@ -3699,7 +3699,16 @@ document.addEventListener('DOMContentLoaded', () => {
                             settings.scheme = s.scheme;
                         const validVision = ['none', 'protanopia', 'deuteranopia', 'tritanopia', 'achromatopsia'];
                         if (validVision.includes(s.vision)) settings.vision = s.vision;
-                        const validModes = ['60-30-10', 'monochromatic', 'analogous', 'complementary', 'split-complementary', 'triadic', 'advanced', 'apply-palette'];
+                        const validModes = [
+                            '60-30-10',
+                            'monochromatic',
+                            'analogous',
+                            'complementary',
+                            'split-complementary',
+                            'triadic',
+                            'advanced',
+                            'apply-palette',
+                        ];
                         if (s.paletteMode && validModes.includes(s.paletteMode)) settings.paletteMode = s.paletteMode;
                         if (typeof s.applyPaletteInput === 'string') settings.applyPaletteInput = s.applyPaletteInput;
                         if (s.clustering && typeof s.clustering === 'object') settings.clustering = s.clustering;
@@ -3863,10 +3872,26 @@ document.addEventListener('DOMContentLoaded', () => {
         const hasScheme = !!(parsed.settings && parsed.settings.scheme);
         const hasVision = !!(parsed.settings && parsed.settings.vision);
         const hasPaletteMode = !!(parsed.settings && parsed.settings.paletteMode);
-        const hasApplyPaletteInput = !!(parsed.settings && typeof parsed.settings.applyPaletteInput === 'string' && parsed.settings.applyPaletteInput !== '');
-        const hasClustering = !!(parsed.settings && parsed.settings.clustering && typeof parsed.settings.clustering === 'object');
+        const hasApplyPaletteInput = !!(
+            parsed.settings &&
+            typeof parsed.settings.applyPaletteInput === 'string' &&
+            parsed.settings.applyPaletteInput !== ''
+        );
+        const hasClustering = !!(
+            parsed.settings &&
+            parsed.settings.clustering &&
+            typeof parsed.settings.clustering === 'object'
+        );
 
-        if (!rawEntries.length && !variableEntries.length && !hasScheme && !hasVision && !hasPaletteMode && !hasApplyPaletteInput && !hasClustering) {
+        if (
+            !rawEntries.length &&
+            !variableEntries.length &&
+            !hasScheme &&
+            !hasVision &&
+            !hasPaletteMode &&
+            !hasApplyPaletteInput &&
+            !hasClustering
+        ) {
             throw new Error('No compatible overrides found in this file');
         }
 
@@ -3963,7 +3988,16 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         if (hasPaletteMode) {
-            const validModes = ['60-30-10', 'monochromatic', 'analogous', 'complementary', 'split-complementary', 'triadic', 'advanced', 'apply-palette'];
+            const validModes = [
+                '60-30-10',
+                'monochromatic',
+                'analogous',
+                'complementary',
+                'split-complementary',
+                'triadic',
+                'advanced',
+                'apply-palette',
+            ];
             if (validModes.includes(parsed.settings.paletteMode)) {
                 paletteModeSelect.value = parsed.settings.paletteMode;
                 updatePaletteModeUI();
@@ -4108,13 +4142,20 @@ document.addEventListener('DOMContentLoaded', () => {
     // Single source of truth — used by both clipboard and file-download paths.
     function _exportFormatOutput(format, dataToExport) {
         switch (format) {
-            case 'css':      return { output: ExporterUtils.toCSS(dataToExport),      ext: 'css'  };
-            case 'json':     return { output: ExporterUtils.toJSON(dataToExport),     ext: 'json' };
-            case 'tailwind': return { output: ExporterUtils.toTailwind(dataToExport), ext: 'js'   };
-            case 'cmyk':     return { output: ExporterUtils.toCMYK(dataToExport),     ext: 'txt'  };
-            case 'lab':      return { output: ExporterUtils.toLAB(dataToExport),      ext: 'txt'  };
-            case 'oklch':    return { output: ExporterUtils.toOKLCH(dataToExport),    ext: 'txt'  };
-            default:         return { output: '',                                      ext: 'txt'  };
+            case 'css':
+                return { output: ExporterUtils.toCSS(dataToExport), ext: 'css' };
+            case 'json':
+                return { output: ExporterUtils.toJSON(dataToExport), ext: 'json' };
+            case 'tailwind':
+                return { output: ExporterUtils.toTailwind(dataToExport), ext: 'js' };
+            case 'cmyk':
+                return { output: ExporterUtils.toCMYK(dataToExport), ext: 'txt' };
+            case 'lab':
+                return { output: ExporterUtils.toLAB(dataToExport), ext: 'txt' };
+            case 'oklch':
+                return { output: ExporterUtils.toOKLCH(dataToExport), ext: 'txt' };
+            default:
+                return { output: '', ext: 'txt' };
         }
     }
 
@@ -4199,7 +4240,9 @@ document.addEventListener('DOMContentLoaded', () => {
                     await navigator.clipboard.writeText(nativeJson);
                     const originalText = button.textContent;
                     button.textContent = 'Copied!';
-                    setTimeout(() => { button.textContent = originalText; }, 1500);
+                    setTimeout(() => {
+                        button.textContent = originalText;
+                    }, 1500);
                     recordExportHistory('palettelive', nativeJson);
                     persistDomainData();
                 }
@@ -4234,7 +4277,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 await navigator.clipboard.writeText(output);
                 const originalText = button.textContent;
                 button.textContent = 'Copied!';
-                setTimeout(() => { button.textContent = originalText; }, 1500);
+                setTimeout(() => {
+                    button.textContent = originalText;
+                }, 1500);
             } catch (error) {
                 console.warn('Clipboard write error:', error);
             }
@@ -4371,7 +4416,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 let name = c.value || '';
                 try {
                     name = c._displayName || (window.ColorNames ? ColorNames.getName(c.value) : c.value) || c.value;
-                } catch (_) { /* keep hex as fallback */ }
+                } catch (_) {
+                    /* keep hex as fallback */
+                }
                 colors.push({
                     hex: c.value,
                     frequency: c.count || 1,
@@ -4385,13 +4432,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 colors: colors,
             };
 
-            chrome.runtime.sendMessage(
-                { type: 'OPEN_HEATMAP_WINDOW', payload: heatmapPayload },
-                () => {
-                    // Ignore response — popup may close before background replies
-                    if (chrome.runtime.lastError) { /* expected if popup closes */ }
+            chrome.runtime.sendMessage({ type: 'OPEN_HEATMAP_WINDOW', payload: heatmapPayload }, () => {
+                // Ignore response — popup may close before background replies
+                if (chrome.runtime.lastError) {
+                    /* expected if popup closes */
                 }
-            );
+            });
         } catch (err) {
             console.error('PaletteLive: Heatmap click error', err);
         }
@@ -4612,7 +4658,10 @@ document.addEventListener('DOMContentLoaded', () => {
             if (chrome.runtime.lastError) {
                 // Session storage quota exceeded or other error — non-fatal.
                 // The dropper will fall back to single-hex mode gracefully.
-                console.warn('PaletteLive: Could not save cluster map to session storage:', chrome.runtime.lastError.message);
+                console.warn(
+                    'PaletteLive: Could not save cluster map to session storage:',
+                    chrome.runtime.lastError.message
+                );
             }
         });
 
@@ -4650,7 +4699,13 @@ document.addEventListener('DOMContentLoaded', () => {
         updateUndoButton();
         // Explicitly clear session storage to avoid stale state on reopen
         baselineScreenshot = null;
-        chrome.storage.session.remove(['palettelive_historyStack', 'palettelive_redoStack', 'sidePanelColorData', 'palettelive_baselineScreenshot', 'palettelive_compare_active']);
+        chrome.storage.session.remove([
+            'palettelive_historyStack',
+            'palettelive_redoStack',
+            'sidePanelColorData',
+            'palettelive_baselineScreenshot',
+            'palettelive_compare_active',
+        ]);
         closeEditor();
 
         compareToggle.checked = false;

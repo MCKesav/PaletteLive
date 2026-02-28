@@ -26,7 +26,9 @@ if (typeof globalThis._colorUtilsVersion !== 'undefined' && globalThis._colorUti
 } else {
     // Clean up stale DOM node from previous injection before re-defining
     if (globalThis.ColorUtils && globalThis.ColorUtils._resolveViaDomEl) {
-        try { globalThis.ColorUtils._resolveViaDomEl.remove(); } catch (e) {}
+        try {
+            globalThis.ColorUtils._resolveViaDomEl.remove();
+        } catch (e) {}
         globalThis.ColorUtils._resolveViaDomEl = null;
     }
     globalThis._colorUtilsVersion = 3;

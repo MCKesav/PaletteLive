@@ -462,7 +462,10 @@
         if (!request || typeof request !== 'object') return false;
         if (typeof request.type !== 'string') return false;
         // If a payload exists, it must be a plain object
-        if (request.payload !== undefined && (typeof request.payload !== 'object' || request.payload === null || Array.isArray(request.payload))) {
+        if (
+            request.payload !== undefined &&
+            (typeof request.payload !== 'object' || request.payload === null || Array.isArray(request.payload))
+        ) {
             // Allow payload to be absent for many message types
             // Only reject array payloads (object is expected)
             if (Array.isArray(request.payload)) return false;
@@ -593,11 +596,7 @@
                 // If the popup is reopened on the same URL within the TTL window,
                 // skip the full DOM scan and respond instantly from memory.
                 const _nowTs = Date.now();
-                if (
-                    _scanCache &&
-                    _scanCache.url === location.href &&
-                    _nowTs - _scanCache.ts < _SCAN_CACHE_TTL_MS
-                ) {
+                if (_scanCache && _scanCache.url === location.href && _nowTs - _scanCache.ts < _SCAN_CACHE_TTL_MS) {
                     PLLog.debug('PaletteLive: EXTRACT_PALETTE served from cache');
                     sendResponse({ success: true, data: _scanCache.data });
                     // Ensure colorElementMap is ready for override operations
@@ -2995,8 +2994,8 @@
 
         // Both screenshots were taken at the same scroll position — set them on
         // their respective panes. No scroll tracking needed.
-        beforePane.style.backgroundImage = `url("${sanitizeCssUrl(beforeImage)}")`;  // original colors
-        afterPane.style.backgroundImage = `url("${sanitizeCssUrl(afterImage)}")`;    // modified colors
+        beforePane.style.backgroundImage = `url("${sanitizeCssUrl(beforeImage)}")`; // original colors
+        afterPane.style.backgroundImage = `url("${sanitizeCssUrl(afterImage)}")`; // modified colors
 
         let divider = Number(payload.divider);
         if (!Number.isFinite(divider)) divider = 50;
@@ -3034,7 +3033,9 @@
         };
         const onPointerUp = (event) => {
             if (dragging) {
-                try { overlay.releasePointerCapture(event.pointerId); } catch (_) {}
+                try {
+                    overlay.releasePointerCapture(event.pointerId);
+                } catch (_) {}
                 overlay.style.pointerEvents = 'none';
                 overlay.style.cursor = '';
             }
@@ -3104,7 +3105,11 @@
         // the style/layout pipeline immediately — without this, fast machines can
         // skip the forced style recalc and the 'before' screenshot may still show
         // residual override colors, especially when there are many changes.
-        try { document.documentElement.getBoundingClientRect(); } catch (e) { /* ignore */ }
+        try {
+            document.documentElement.getBoundingClientRect();
+        } catch (e) {
+            /* ignore */
+        }
     }
 
     function restoreAfterComparison() {

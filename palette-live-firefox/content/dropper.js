@@ -309,7 +309,10 @@ if (window._dropperVersion === _DROPPER_VERSION) {
                         try {
                             const target = Dropper._lastHitPickedElement || topEl;
                             const cs = window.getComputedStyle(target);
-                            if (cs.backgroundColor + '|' + cs.color + '|' + cs.backgroundImage === Dropper._lastHitStyle) {
+                            if (
+                                cs.backgroundColor + '|' + cs.color + '|' + cs.backgroundImage ===
+                                Dropper._lastHitStyle
+                            ) {
                                 Dropper._lastPickedElement = target;
                                 return Dropper._lastHitHex;
                             }

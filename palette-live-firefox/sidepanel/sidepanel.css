@@ -62,7 +62,9 @@ body {
     white-space: nowrap;
     margin-left: auto;
     opacity: 0.85;
-    transition: color 0.15s, opacity 0.15s;
+    transition:
+        color 0.15s,
+        opacity 0.15s;
 }
 
 .editor-support-link:hover {

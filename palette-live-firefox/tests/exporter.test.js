@@ -244,7 +244,9 @@ describe('ExporterUtils.toTailwind edge cases', () => {
 
 describe('ExporterUtils.toJSON with ColorNames', () => {
     test('includes color name when available', () => {
-        const spy = jest.spyOn(global.ColorNames, 'getName').mockImplementation((val) => (val === '#ff0000' ? 'Red' : null));
+        const spy = jest
+            .spyOn(global.ColorNames, 'getName')
+            .mockImplementation((val) => (val === '#ff0000' ? 'Red' : null));
 
         const json = ExporterUtils.toJSON([{ name: '--primary', value: '#ff0000' }]);
         const parsed = JSON.parse(json);

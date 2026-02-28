@@ -1,6 +1,7 @@
 # PaletteLive — Full Feature List
 
 ## 1. Color Extraction
+
 - Full DOM scan using `getComputedStyle` on every element (including `<html>`)
 - Traverses open **Shadow DOM** trees via `ShadowWalker` (depth-limited, element-capped)
 - Parses all `document.styleSheets` (including shadow root stylesheets) for raw color values
@@ -13,6 +14,7 @@
 ---
 
 ## 2. Real-Time Color Override System
+
 - Overrides colors live on the page by patching `element.style` inline (no page reload)
 - Falls back to injected CSS class rules when inline style is blocked or insufficient
 - **Bulk override pipeline** (4-phase): builds lookup from `colorElementMap` → applies inline overrides → injects fallback CSS classes → writes all CSS rules in one batch `<style>` tag
@@ -26,6 +28,7 @@
 ---
 
 ## 3. Color Dropper
+
 - Click any element on the page to pick its computed color
 - Full-screen crosshair overlay with a floating color preview swatch and hex label
 - Inline floating editor opens at the picked element for immediate color change
@@ -35,6 +38,7 @@
 ---
 
 ## 4. Side Panel Editor
+
 - Chrome side panel opens alongside any page for non-blocking color editing
 - Native `<input type="color">` picker with **real-time preview** (RAF-throttled)
 - Real-time toggle — live updates on every picker move, or commit only on release
@@ -47,6 +51,7 @@
 ---
 
 ## 5. Undo / Redo History
+
 - Full per-source undo/redo stack for all color changes
 - Batch history entries for bulk operations (palette apply, import apply)
 - Undo/Redo buttons in popup with visual disabled state when stack is empty
@@ -54,34 +59,38 @@
 ---
 
 ## 6. Color Clustering
+
 - Groups visually similar colors using **CIEDE2000** perceptual distance + alpha channel
 - Two-pass algorithm: greedy assignment then global reassignment to fix order-sensitive mis-assignments
 - Weighted centroid recalculation per cluster
 - Adaptive threshold for near-neutral/transparent colors
 - Cluster threshold **slider** (0–100) with live summary ("X colors merged into Y")
 - Three palette render modes selectable from the popup:
-  - **Normal** — all colors shown individually
-  - **Clustered** — similar colors merged into one representative swatch
-  - **Aggressive Merge** — HSL-based hard merge for highly similar hues
+    - **Normal** — all colors shown individually
+    - **Clustered** — similar colors merged into one representative swatch
+    - **Aggressive Merge** — HSL-based hard merge for highly similar hues
 
 ---
 
 ## 7. Color Palette Generator
+
 Six built-in harmony generators produce ready-to-use palettes from a base color:
 
-| Generator | Description |
-|-----------|-------------|
-| **Monochromatic** | N shades of a single hue (count slider 2–12) |
-| **60-30-10** | Three-role palette: dominant (60%), secondary (30%), accent (10%) |
-| **Analogous** | Adjacent hues with configurable spread angle |
-| **Complementary** | Base hue + opposite hue |
-| **Split-Complementary** | Base hue + two hues flanking its complement (gap slider) |
-| **Triadic** | Three equally-spaced hues (120° apart) |
+| Generator               | Description                                                       |
+| ----------------------- | ----------------------------------------------------------------- |
+| **Monochromatic**       | N shades of a single hue (count slider 2–12)                      |
+| **60-30-10**            | Three-role palette: dominant (60%), secondary (30%), accent (10%) |
+| **Analogous**           | Adjacent hues with configurable spread angle                      |
+| **Complementary**       | Base hue + opposite hue                                           |
+| **Split-Complementary** | Base hue + two hues flanking its complement (gap slider)          |
+| **Triadic**             | Three equally-spaced hues (120° apart)                            |
 
 ---
 
 ## 8. Palette Analysis
+
 Detects whether the current page palette matches a color harmony and shows a scored breakdown:
+
 - 60-30-10 role analysis (dominant / secondary / accent classification)
 - Monochromatic analysis (hue consistency, lightness spread)
 - Analogous analysis (hue proximity, spread angle)
@@ -92,31 +101,33 @@ Detects whether the current page palette matches a color harmony and shows a sco
 ---
 
 ## 9. Import Palette & Auto-Apply
+
 - **Import from file** (file picker, any text-based format)
 - **Import from clipboard** (modal textarea with paste button)
 - Format selector for parsing: CSS variables, JSON tokens, plain hex list, etc.
 - **Auto-map mode** — maps imported palette onto page colors using contrast-relationship preservation:
-  1. Clusters page colors
-  2. 1:1 luminance-proximity assignment of anchor colors
-  3. Detects broken contrast pairs post-mapping
-  4. Repairs broken pairs by choosing the import color that best restores contrast
-  5. Maps all remaining clusters to nearest palette color
+    1. Clusters page colors
+    2. 1:1 luminance-proximity assignment of anchor colors
+    3. Detects broken contrast pairs post-mapping
+    4. Repairs broken pairs by choosing the import color that best restores contrast
+    5. Maps all remaining clusters to nearest palette color
 - **Manual-map mode** — user provides an ordered hex list; extension assigns by role scoring (background / text / accent heuristics via HSL analysis)
 - Preview chips shown before applying
 
 ---
 
 ## 10. Export
+
 Six export formats, all accessible from the popup export menu:
 
-| Format | Output |
-|--------|--------|
-| **CSS Variables** | `:root { --name: value; }` with source comments |
-| **JSON Tokens** | Design token JSON with `value`, `source`, and color name fields |
+| Format              | Output                                                            |
+| ------------------- | ----------------------------------------------------------------- |
+| **CSS Variables**   | `:root { --name: value; }` with source comments                   |
+| **JSON Tokens**     | Design token JSON with `value`, `source`, and color name fields   |
 | **Tailwind Config** | `module.exports` config block with arbitrary value usage examples |
-| **CMYK** | Device-independent CMYK approximation as CSS-comment palette |
-| **CIE LAB** | `lab(L% a b)` values (D50 illuminant) |
-| **OKLCH** | `oklch(L% C H)` perceptually-uniform modern CSS values |
+| **CMYK**            | Device-independent CMYK approximation as CSS-comment palette      |
+| **CIE LAB**         | `lab(L% a b)` values (D50 illuminant)                             |
+| **OKLCH**           | `oklch(L% C H)` perceptually-uniform modern CSS values            |
 
 > **Copy to clipboard** is a delivery method available for any format, not a separate format.
 
@@ -127,6 +138,7 @@ Six export formats, all accessible from the popup export menu:
 ---
 
 ## 11. Heatmap
+
 - Overlays colored outlines on every element that has a non-default color
 - Hover tooltip shows hex values for all color properties (bg, text, border, outline, etc.)
 - Primary hue of each element determines outline color (perceptual heat visualization)
@@ -136,6 +148,7 @@ Six export formats, all accessible from the popup export menu:
 ---
 
 ## 12. Before / After Comparison
+
 - Toggle captures a screenshot of the visible viewport before any overrides
 - Splits the screen with an animated sliding divider: **left = original**, **right = current**
 - Handles iframes, background images, and CSS gradient backgrounds
@@ -144,6 +157,7 @@ Six export formats, all accessible from the popup export menu:
 ---
 
 ## 13. Accessibility — Automatic Text Contrast Enforcement
+
 - After any color override, schedules 3 contrast-enforcement passes (immediate, deferred, idle)
 - Walks all text elements in the affected subtree
 - Picks the best palette color as a text color replacement that satisfies WCAG AA (4.5:1 normal, 3:1 large)
@@ -153,20 +167,23 @@ Six export formats, all accessible from the popup export menu:
 ---
 
 ## 14. Vision Simulation (Color Blindness)
+
 - Applies SVG filter overlays to simulate vision deficiencies:
-  - Protanopia, Deuteranopia, Tritanopia (and more based on selector options)
+    - Protanopia, Deuteranopia, Tritanopia (and more based on selector options)
 - Toggle via the vision dropdown in the popup
 - Injected as `<feColorMatrix>` SVG filter in a `<defs>` block applied to the page root
 
 ---
 
 ## 15. Color Scheme Override
+
 - Force a page into **light mode** or **dark mode** via injected `color-scheme` CSS
 - Useful for testing dark-mode palette behavior on pages that follow `prefers-color-scheme`
 
 ---
 
 ## 16. Persistence & Per-Domain State
+
 - All overrides, palette data, and settings saved to `chrome.storage.local` keyed by domain
 - **Auto-resume after reload** — re-applies saved palette automatically when the page reloads
 - **SPA route detection** — patches `history.pushState` / `history.replaceState` (double-patch guarded) and listens to `popstate` to re-apply palette on route changes
@@ -177,6 +194,7 @@ Six export formats, all accessible from the popup export menu:
 ---
 
 ## 17. Popup UI Utilities
+
 - **Dark / Light / Auto theme** toggle for the popup itself (three-state cycle)
 - **Palette summary bar** — shows total colors found and active filter/mode
 - **Footer notices** — transient status messages for scan, export, import, and error events
@@ -186,6 +204,7 @@ Six export formats, all accessible from the popup export menu:
 ---
 
 ## 18. Architecture & Infrastructure
+
 - Chrome Extension **Manifest V3** with a background service worker, popup, side panel, and content scripts
 - Content scripts injected at `document_idle` into all frames (`all_frames: true`)
 - **Re-injection guard** — version-stamped globals prevent duplicate script execution after extension updates

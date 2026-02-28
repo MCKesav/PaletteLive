@@ -250,7 +250,9 @@ if (typeof globalThis._colorScienceVersion !== 'undefined' && globalThis._colorS
             if (!globalThis.ColorUtils) {
                 globalThis.ColorUtils = require('./colorUtils');
             }
-        } catch (e) { /* optional peer dependency */ }
+        } catch (e) {
+            /* optional peer dependency */
+        }
         module.exports = ColorScience;
     } else {
         globalThis.ColorScience = ColorScience;

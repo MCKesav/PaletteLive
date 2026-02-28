@@ -23,8 +23,17 @@ if (window._shadowWalkerVersion === _SHADOW_WALKER_VERSION) {
         // Non-visual element tags that never carry rendered color — skipping them
         // avoids unnecessary getComputedStyle calls downstream.
         _NON_VISUAL_TAGS: new Set([
-            'SCRIPT', 'STYLE', 'META', 'LINK', 'NOSCRIPT', 'TEMPLATE',
-            'HEAD', 'TITLE', 'BASE', 'BR', 'WBR',
+            'SCRIPT',
+            'STYLE',
+            'META',
+            'LINK',
+            'NOSCRIPT',
+            'TEMPLATE',
+            'HEAD',
+            'TITLE',
+            'BASE',
+            'BR',
+            'WBR',
         ]),
 
         /**
@@ -74,7 +83,8 @@ if (window._shadowWalkerVersion === _SHADOW_WALKER_VERSION) {
                 if (
                     !node.shadowRoot &&
                     node.attachShadow &&
-                    node.tagName && node.tagName.includes('-') &&
+                    node.tagName &&
+                    node.tagName.includes('-') &&
                     node.childElementCount === 0 &&
                     node.childNodes.length === 0
                 ) {

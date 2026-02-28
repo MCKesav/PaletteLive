@@ -27,7 +27,11 @@ if (window._extractorVersion === _EXTRACTOR_VERSION) {
         scan: async () => {
             if (!window.ColorUtils) return { colors: [], variables: [] };
             const _scanStartTime = performance.now();
-            const elements = window.ShadowWalker ? window.ShadowWalker.getAllElements() : (document.body ? [document.body] : [document.documentElement]);
+            const elements = window.ShadowWalker
+                ? window.ShadowWalker.getAllElements()
+                : document.body
+                  ? [document.body]
+                  : [document.documentElement];
 
             // Ensure <html> (documentElement) is included — ShadowWalker starts
             // from document.body, so the <html> element is normally missed.
@@ -305,11 +309,14 @@ if (window._extractorVersion === _EXTRACTOR_VERSION) {
                         const _btc = style.borderTopColor;
                         Extractor._addComputedColor(_btc, colorMap, borderCategory, null, hiddenWeight);
                         const _brc = style.borderRightColor;
-                        if (_brc !== _btc) Extractor._addComputedColor(_brc, colorMap, borderCategory, null, hiddenWeight);
+                        if (_brc !== _btc)
+                            Extractor._addComputedColor(_brc, colorMap, borderCategory, null, hiddenWeight);
                         const _bbc = style.borderBottomColor;
-                        if (_bbc !== _btc && _bbc !== _brc) Extractor._addComputedColor(_bbc, colorMap, borderCategory, null, hiddenWeight);
+                        if (_bbc !== _btc && _bbc !== _brc)
+                            Extractor._addComputedColor(_bbc, colorMap, borderCategory, null, hiddenWeight);
                         const _blc = style.borderLeftColor;
-                        if (_blc !== _btc && _blc !== _brc && _blc !== _bbc) Extractor._addComputedColor(_blc, colorMap, borderCategory, null, hiddenWeight);
+                        if (_blc !== _btc && _blc !== _brc && _blc !== _bbc)
+                            Extractor._addComputedColor(_blc, colorMap, borderCategory, null, hiddenWeight);
 
                         // Outline
                         const hasOutline = style.outlineStyle !== 'none' && parseFloat(style.outlineWidth) > 0;
@@ -410,26 +417,26 @@ if (window._extractorVersion === _EXTRACTOR_VERSION) {
                         // ::before or ::after per the CSS spec — skip those 2 costly
                         // getComputedStyle calls entirely for these tags.
                         if (!Extractor._voidTags.has(el.tagName)) {
-                        for (const pseudo of ['::before', '::after']) {
-                            try {
-                                const pseudoStyle = window.getComputedStyle(el, pseudo);
-                                for (const prop of directProps) {
-                                    Extractor._addComputedColor(
-                                        pseudoStyle[prop],
-                                        colorMap,
-                                        propCategoryMap[prop],
-                                        null,
-                                        hiddenWeight
-                                    );
+                            for (const pseudo of ['::before', '::after']) {
+                                try {
+                                    const pseudoStyle = window.getComputedStyle(el, pseudo);
+                                    for (const prop of directProps) {
+                                        Extractor._addComputedColor(
+                                            pseudoStyle[prop],
+                                            colorMap,
+                                            propCategoryMap[prop],
+                                            null,
+                                            hiddenWeight
+                                        );
+                                    }
+                                    const pseudoBg = pseudoStyle.backgroundImage;
+                                    if (pseudoBg && pseudoBg !== 'none' && pseudoBg.includes('gradient')) {
+                                        Extractor._extractColorsFromCSSValue(pseudoBg, colorMap, 'background');
+                                    }
+                                } catch (error) {
+                                    // Ignore pseudo-element failures.
                                 }
-                                const pseudoBg = pseudoStyle.backgroundImage;
-                                if (pseudoBg && pseudoBg !== 'none' && pseudoBg.includes('gradient')) {
-                                    Extractor._extractColorsFromCSSValue(pseudoBg, colorMap, 'background');
-                                }
-                            } catch (error) {
-                                // Ignore pseudo-element failures.
                             }
-                        }
                         } // end !_voidTags pseudo-element guard
 
                         // Tailwind utility extras
@@ -484,10 +491,14 @@ if (window._extractorVersion === _EXTRACTOR_VERSION) {
             const totalElements = elements.length;
             const wasCapped = elements.length > ELEMENT_LIMIT;
             if (wasCapped) {
-                console.warn(`PaletteLive: Large DOM detected (${totalElements} elements). Scan was capped at ${ELEMENT_LIMIT} elements. Some colors may not be captured.`);
+                console.warn(
+                    `PaletteLive: Large DOM detected (${totalElements} elements). Scan was capped at ${ELEMENT_LIMIT} elements. Some colors may not be captured.`
+                );
             }
             if (_scanDuration > 3000) {
-                console.warn(`PaletteLive: Scan took ${_scanDuration}ms. Consider using a lighter page or closing unnecessary tabs.`);
+                console.warn(
+                    `PaletteLive: Scan took ${_scanDuration}ms. Consider using a lighter page or closing unnecessary tabs.`
+                );
             }
             return {
                 colors,
@@ -860,7 +871,23 @@ if (window._extractorVersion === _EXTRACTOR_VERSION) {
         // Elements that cannot have ::before / ::after pseudo-elements per the CSS spec.
         // Skipping getComputedStyle(el, '::before/::after') on these saves 2 expensive
         // style-resolution calls per element on every scan.
-        _voidTags: new Set(['IMG', 'INPUT', 'BR', 'HR', 'SOURCE', 'TRACK', 'AREA', 'BASE', 'COL', 'EMBED', 'LINK', 'META', 'PARAM', 'WBR', 'IFRAME']),
+        _voidTags: new Set([
+            'IMG',
+            'INPUT',
+            'BR',
+            'HR',
+            'SOURCE',
+            'TRACK',
+            'AREA',
+            'BASE',
+            'COL',
+            'EMBED',
+            'LINK',
+            'META',
+            'PARAM',
+            'WBR',
+            'IFRAME',
+        ]),
 
         /**
          * CSS-only area weight heuristic — avoids getBoundingClientRect which

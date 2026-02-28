@@ -4,10 +4,5 @@ module.exports = {
     roots: ['<rootDir>/tests'],
     testMatch: ['**/*.test.js'],
     coverageDirectory: 'coverage',
-    collectCoverageFrom: [
-        'utils/**/*.js',
-        'content/shadowWalker.js',
-        'content/injector.js',
-        '!utils/constants.js',
-    ],
+    collectCoverageFrom: ['utils/**/*.js', 'content/shadowWalker.js', 'content/injector.js', '!utils/constants.js'],
 };

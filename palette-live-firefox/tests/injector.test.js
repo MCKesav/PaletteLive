@@ -105,8 +105,8 @@ describe('Injector', () => {
     test('rejects invalid selectors', () => {
         Injector.apply({
             selectors: {
-                'body': { color: 'red' },        // not a .pl- class
-                '.pl-valid': { color: 'blue' },   // valid
+                body: { color: 'red' }, // not a .pl- class
+                '.pl-valid': { color: 'blue' }, // valid
             },
         });
         const style = document.getElementById('palettelive-overrides');
@@ -118,8 +118,8 @@ describe('Injector', () => {
         Injector.apply({
             selectors: {
                 '.pl-test': {
-                    'color': 'red',
-                    'INVALID_PROP': 'blue',
+                    color: 'red',
+                    INVALID_PROP: 'blue',
                 },
             },
         });

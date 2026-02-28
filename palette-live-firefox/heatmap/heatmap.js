@@ -21,10 +21,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Get target tab ID + pre-built data from session storage (set by popup)
     try {
-        const session = await chrome.storage.session.get([
-            'palettelive_heatmapTabId',
-            'palettelive_heatmapData',
-        ]);
+        const session = await chrome.storage.session.get(['palettelive_heatmapTabId', 'palettelive_heatmapData']);
         if (session.palettelive_heatmapTabId) {
             currentTabId = session.palettelive_heatmapTabId;
         }
@@ -100,7 +97,9 @@ async function refreshData() {
             colorData.forEach((item) => {
                 try {
                     item.name = ColorNames.getName(item.hex);
-                } catch (e) { /* keep hex as name */ }
+                } catch (e) {
+                    /* keep hex as name */
+                }
             });
         }
 
