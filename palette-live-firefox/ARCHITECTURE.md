@@ -27,6 +27,7 @@
     - [StorageUtils](#84-storageutils)
     - [ExporterUtils](#85-exporterutils)
     - [Constants](#86-constants)
+    - [ColorScience](#87-colorscience)
 9. [Message Bus (Full Message Type Reference)](#9-message-bus-full-message-type-reference)
 10. [State Management & Storage](#10-state-management--storage)
 11. [The Complete Scan → Edit → Export Flow](#11-the-complete-scan--edit--export-flow)
@@ -48,7 +49,7 @@
 
 ## 1. High-Level Overview
 
-PaletteLive is a **Manifest V3 Chrome extension** that:
+PaletteLive is a **Manifest V3 Firefox extension** that:
 
 1. Injects a content script bundle into every web page.
 2. On user request, walks the entire DOM (including open Shadow DOMs) and extracts every computed color.
@@ -58,12 +59,12 @@ PaletteLive is a **Manifest V3 Chrome extension** that:
 
 ```
 ┌────────────────────────────────────────────────────────────┐
-│                      Chrome Browser                         │
+│                     Firefox Browser                         │
 │                                                            │
 │  ┌──────────────┐   messages   ┌────────────────────────┐  │
 │  │  background  │◄────────────►│  popup / sidepanel     │  │
-│  │ (service     │              │  (extension pages)     │  │
-│  │  worker)     │              └────────────────────────┘  │
+│  │ (persistent  │              │  (extension pages)     │  │
+│  │  script)     │              └────────────────────────┘  │
 │  └──────┬───────┘                                          │
 │         │ chrome.tabs.sendMessage                          │
 │         ▼                                                  │
@@ -88,22 +89,24 @@ PaletteLive is a **Manifest V3 Chrome extension** that:
 
 `manifest.json` declares every entry point:
 
-| Key                            | Value                      | Purpose                                           |
-| ------------------------------ | -------------------------- | ------------------------------------------------- |
-| `background.service_worker`    | `background.js`            | Service worker — always running (wakes on events) |
-| `action.default_popup`         | `popup/popup.html`         | Popup shown when toolbar icon is clicked          |
-| `side_panel.default_path`      | `sidepanel/sidepanel.html` | Color editor window                               |
-| `content_scripts[].js`         | (10 files, see below)      | Injected into every `<all_urls>` page             |
-| `content_scripts[].run_at`     | `document_idle`            | Injected after the DOM is parsed and idle         |
-| `content_scripts[].all_frames` | `true`                     | Runs in iframes too                               |
+| Key                            | Value                                                              | Purpose                                              |
+| ------------------------------ | ------------------------------------------------------------------ | ---------------------------------------------------- |
+| `background.scripts`           | `["utils/storage.js", "utils/colorUtils.js", "background.js"]`   | Persistent background script — pre-loads utilities   |
+| `action.default_popup`         | `popup/popup.html`                                                 | Popup shown when toolbar icon is clicked             |
+| `content_scripts[].js`         | (10 files, see below)                                              | Injected into every `<all_urls>` page                |
+| `content_scripts[].run_at`     | `document_idle`                                                    | Injected after the DOM is parsed and idle            |
+| `content_scripts[].all_frames` | `true`                                                             | Runs in iframes too                                  |
+| `browser_specific_settings`    | `gecko.id`, `strict_min_version: 140.0`, `data_collection_permissions` | Firefox extension ID, minimum version, data policy |
 
-### Step 2 — Background service worker wakes (`background.js`)
+### Step 2 — Background script loads (`background.js`)
 
-Runs `chrome.runtime.onInstalled` (logs install) and immediately tries to restore `activeEditorWindowId` from `chrome.storage.session`. This covers the case where the service worker was killed between activations — it verifies the stored window ID is still alive via `chrome.windows.get` before accepting it.
+Firefox MV3 loads background scripts using `"scripts"` in the manifest (not `"service_worker"`), so `utils/storage.js` and `utils/colorUtils.js` are pre-loaded and available to background.js as globals. The background script is **persistent** — it is not killed and re-woken like a Chrome service worker.
+
+Runs `chrome.runtime.onInstalled` (logs install) and immediately tries to restore `activeEditorWindowId` from `chrome.storage.session`. It verifies the stored window ID is still alive via `chrome.windows.get` before accepting it.
 
 ### Step 3 — Content script bundle injects into every page at `document_idle`
 
-The scripts are loaded **in order** (Chrome guarantees sequential injection for content scripts declared in the manifest):
+The scripts are loaded **in order** (Firefox guarantees sequential injection for content scripts declared in the manifest):
 
 ```
 utils/constants.js       → PLConfig, MessageTypes, PLLog (shared config & message catalogue)
@@ -136,7 +139,7 @@ PaletteLive code runs in three isolated JavaScript contexts that can only talk t
 
 | Context            | Script(s)                           | Lifetime                                 | DOM access              |
 | ------------------ | ----------------------------------- | ---------------------------------------- | ----------------------- |
-| **Service Worker** | `background.js`                     | Event-driven, can be killed and re-woken | None                    |
+| **Background Script** | `background.js`                  | Persistent (not killed/re-woken)         | None                    |
 | **Extension Page** | `popup.js`, `sidepanel.js`          | Alive only while the page is open        | Own page only           |
 | **Content Script** | Everything in `content/` + `utils/` | Same as the tab                          | Full access to page DOM |
 
@@ -275,7 +278,7 @@ The color dropper lets users click any element to sample its color:
 
 ### 4.7 content.js — The Orchestrator
 
-**File:** `content/content.js` (3 815 lines)
+**File:** `content/content.js`
 
 This is the main content script. It owns all runtime state and handles every message from the background/popup:
 
@@ -285,7 +288,12 @@ This is the main content script. It owns all runtime state and handles every mes
 | `overrideMap`        | `WeakMap<Element, Map<cssProp, snapshot>>` | Tracks inline override snapshots for reverting             |
 | `overrideRefs`       | `WeakRef[]`                                | Weak references to overridden elements (pruned every 60 s) |
 | `rawOverrideState`   | `Map<original, current>`                   | The currently active color substitutions                   |
+| `addedFallbackClasses` | `Set<string>`                            | Fallback CSS classes added by PaletteLive (pruned on reset)|
+| `highlightedElements`| `Set<Element>`                             | Elements currently receiving the highlight outline         |
 | `_scanCache`         | `{url, data, ts}`                          | In-memory scan result cache (2-minute TTL)                 |
+| `isRescanning`       | `boolean`                                  | Guards against APPLY_OVERRIDE racing with RESET_AND_RESCAN |
+| `_scanInProgress`    | `boolean`                                  | Guards against concurrent Extractor.scan() calls           |
+| `pendingOverrides`   | `Array`                                    | Queued overrides during a rescan                           |
 | `__plPaused`         | `boolean`                                  | When `true`, all background activity suspends              |
 | `comparisonSnapshot` | DOM snapshot                               | Before-state for the split comparison overlay              |
 
@@ -296,9 +304,10 @@ This is the main content script. It owns all runtime state and handles every mes
 - **`APPLY_OVERRIDE_FAST`** — same but without building the element map (used during live scrubbing in the editor).
 - **`REMOVE_RAW_OVERRIDE`** — restores original inline style from `overrideMap` snapshot.
 - **`RESET_AND_RESCAN`** — resets all overrides → waits for style settle → rescans.
-- **`HIGHLIGHT_COLOR`** — adds a CSS outline highlight to all elements using that color.
-- **`PICK_COLOR`** → `CANCEL_PICK`\*\* — delegates to `Dropper.start()` / `Dropper.cancel()`.
+- **`HIGHLIGHT_ELEMENTS`** — adds a CSS outline highlight to all elements using that color.
+- **`PICK_COLOR`** → **`CANCEL_PICK`** — delegates to `Dropper.start()` / `Dropper.cancel()`.
 - **`SUSPEND_FOR_COMPARISON` / `RESTORE_AFTER_COMPARISON`** — freezes / unfreezes the page state for the before/after comparison overlay.
+- **`WAIT_FOR_PAINT`** — waits for two animation frames + optional settle delay, then responds; used by the popup to synchronize screenshot captures.
 - **`FIX_TEXT_CONTRAST`** — finds all text elements failing WCAG AA and injects corrected colors.
 - **`PAUSE_EXTENSION` / `RESUME_EXTENSION`** — halts/resumes the observer and all background timers.
 
@@ -318,15 +327,17 @@ A `MutationObserver` watches `document` for DOM mutations. When it detects a URL
 
 ---
 
-## 5. Background Service Worker
+## 5. Background Script
 
 **File:** `background.js`
 
-The service worker is the **message relay hub**. It never touches the page DOM; it just routes messages and persists data.
+The background script is the **message relay hub**. It never touches the page DOM; it just routes messages and persists data.
+
+Firefox MV3 loads background scripts via the manifest `"scripts"` array rather than a service worker, so two utility files are pre-loaded before `background.js` runs: `utils/storage.js` (exposes `StorageUtils`) and `utils/colorUtils.js` (exposes `ColorUtils`). No `importScripts()` call is required.
 
 ### Persistent State
 
-Because MV3 service workers can be killed at any time, critical state is stored in `chrome.storage.session` (survives sleep/wake but not extension reload):
+Session state is stored in `chrome.storage.session` (survives sleep/wake and popup close, but not extension reload):
 
 - `activeEditorWindowId` — the ID of the currently open editor popup window.
 - `activeHeatmapWindowId` — the ID of the currently open heatmap analysis window.
@@ -354,7 +365,7 @@ When the editor or heatmap window is closed, `chrome.windows.onRemoved` fires an
 
 ## 6. Popup (popup.js)
 
-**File:** `popup/popup.js` (4 987 lines)
+**File:** `popup/popup.js`
 
 The popup is the main user interface. It opens when the user clicks the toolbar icon.
 
@@ -363,16 +374,20 @@ The popup is the main user interface. It opens when the user clicks the toolbar 
 ```
 DOMContentLoaded
   │
+  ├── Remove stale 'palettelive_popup_size' key from local storage
   ├── Load saved theme (chrome.storage.local → 'palettelive_popup_theme')
   ├── Load extension pause state for current domain
   ├── Get active tab → query domain
+  ├── Restore historyStack + redoStack from chrome.storage.session
   ├── Load persisted palette from StorageUtils.getPalette(domain)
   └── Send EXTRACT_PALETTE to content script (15 s timeout)
         │
+        ├── If content script not responding: injectContentScripts() → waitForContentScriptReady() → retry
         └── Response: { colors, variables, overrides, domain }
               │
               ├── Apply any saved raw overrides (APPLY_OVERRIDE_BULK)
               ├── Build clusterMap and save to chrome.storage.session
+              ├── Capture baseline screenshot (captureBaseline) if no overrides active
               └── Render palette list (renderPalette)
 ```
 
@@ -387,6 +402,14 @@ DOMContentLoaded
 - WCAG contrast badge
 - Edit button (opens sidepanel editor)
 - Highlight button (sends `HIGHLIGHT_COLOR`)
+
+### Theme Toggle
+
+A cycle button (`#theme-toggle`) rotates through `['light', 'dark', 'auto']` states. The chosen theme is persisted to `chrome.storage.local` under `palettelive_popup_theme`. In `auto` mode the system `prefers-color-scheme` media query is respected.
+
+### Undo / Redo
+
+A 50-entry `historyStack` and `redoStack` provide full undo/redo support. Both stacks are serialized to `chrome.storage.session` (`palettelive_historyStack`, `palettelive_redoStack`) so they survive popup close/reopen. Batch operations (e.g. import, cluster apply) push a single `{ type: 'batch', changes: [...] }` entry so a single undo reverts all changes atomically.
 
 ### Scan Button
 
@@ -407,15 +430,16 @@ When clustering is enabled, `clusterColors(colors, threshold)` in popup.js group
 
 ## 7. Side Panel / Editor Window (sidepanel.js)
 
-**File:** `sidepanel/sidepanel.js` (329 lines)
+**File:** `sidepanel/sidepanel.js`
 
-The editor opens as a `chrome.windows.create` popup (340 × 600) pointing at `sidepanel/sidepanel.html`. It loads its initial data from `chrome.storage.session['sidePanelColorData']`.
+The editor opens as a `chrome.windows.create` popup (340 × 600) pointing at `sidepanel/sidepanel.html`. It loads its initial data from `chrome.storage.session['sidePanelColorData']` and also listens for `chrome.storage.onChanged` in the `'session'` area — this allows the popup to push updated color data (e.g. after an undo) without re-opening the window.
 
 ### State
 
 - `selectedSources` — array of source hex values that the current edit applies to (supports editing merged clusters)
 - `selectedColor` — the color being edited
 - `currentTabId` — the tab ID the editor is targeting
+- `editStartValues` — `Map<source, startHex>` tracking the starting value per source for accurate undo history
 
 ### Live Editing Flow
 
@@ -423,15 +447,19 @@ The editor opens as a `chrome.windows.create` popup (340 × 600) pointing at `si
 User drags color picker
   → colorPicker 'input' event fires
   → sanitizePickerHex(value)
-  → sendMessage SIDEPANEL_COLOR_CHANGED { newValue, sources, fast: true, tabId }
-  → background relays APPLY_OVERRIDE_FAST to content script
-  → content script mutates inline styles immediately (no DOM re-scan)
+  → If realtimeToggle is ON: sendMessage SIDEPANEL_COLOR_CHANGED { newValue, sources, fast: true, tabId }
+      → background relays APPLY_OVERRIDE_FAST to content script
+      → content script mutates inline styles immediately (no DOM re-scan)
   → UI updates: contrast ratio, WCAG badges, color label
+
+If realtimeToggle is OFF:
+  Only local UI updates (picker + label + contrast) happen during drag.
+  The page is updated once on the 'change' event (picker released).
 ```
 
 ```
-User releases / clicks Apply
-  → sendMessage SIDEPANEL_COLOR_COMMITTED { finalValue, sources, tabId }
+User releases / clicks Apply (color 'change' event)
+  → sendMessage SIDEPANEL_COLOR_COMMITTED { finalValue, sources, startValues, tabId }
   → background relays APPLY_OVERRIDE_BULK to content script AND persists to storage
 ```
 
@@ -441,7 +469,11 @@ Displays real-time WCAG 2.1 contrast ratio against white (`#ffffff`) using `getC
 
 ### Export Select Mode
 
-`#export-select-toggle` lets the user select a subset of colors in the editor window to export. The selection is passed back to the popup's export pipeline.
+`#export-select-toggle` (a checkbox) marks whether the current color cluster is included in exports. On change it sends `SIDEPANEL_EXPORT_TOGGLED` directly to the popup (via `chrome.runtime.sendMessage`), which updates the `exportSelection` set and swatch UI without background involvement.
+
+### Batch Apply
+
+`#batch-apply-btn` sends `SIDEPANEL_BATCH_APPLY` to the popup, which applies the current picker color to all export-selected colors atomically.
 
 ---
 
@@ -449,7 +481,7 @@ Displays real-time WCAG 2.1 contrast ratio against white (`#ffffff`) using `getC
 
 ### 8.1 ColorUtils
 
-**File:** `utils/colorUtils.js`
+**File:** `utils/colorUtils.js` (version 3)
 
 Universal CSS color parser. Strategy:
 
@@ -457,14 +489,16 @@ Universal CSS color parser. Strategy:
 2. If input starts with `rgb/rgba` → fast `_rgbStringToHex()` (most common case from `getComputedStyle`)
 3. If `oklch` → `_oklchStringToHex()` (full mathematical conversion via OKLab LMS matrices)
 4. If `oklab` → `_oklabStringToHex()`
-5. Everything else (`hsl`, `hwb`, `lab`, `color()`, named colors) → `_resolveViaDom()`: assigns the value to a temporary `div.style.backgroundColor`, reads back the browser-resolved `rgb()` value, then parses it.
+5. Everything else (`hsl`, `hwb`, `lab`, `lch`, `color()`, named colors) → `_resolveViaDom()`: assigns the value to a temporary `div.style.backgroundColor`, reads back the browser-resolved `rgb()` value, then parses it.
 
 Also exposes:
 
+- `rgbToHex8(input)` — normalizes to `#rrggbbaa`; strips the `ff` suffix if fully opaque, returning bare `#rrggbb`
 - `hexToExportString(hex)` — returns `rgba()` only if alpha < 1, otherwise bare hex
 - `hexToRgb(hex)` — `{ r, g, b, a }`
-- `colorDistance(a, b)` — Euclidean RGB distance for clustering
+- `colorDistance(a, b)` — Euclidean RGB distance (used internally; clustering now uses CIEDE2000 via `ColorScience`)
 - `lighten(hex, amount)` / `darken(hex, amount)`
+- `isValidColor(value)` — safe test whether the browser can parse a color string
 
 ### 8.2 ColorNames
 
@@ -535,26 +569,40 @@ Alpha channels are preserved: `ColorUtils.hexToExportString` emits `rgba(r, g, b
 Exports three frozen objects to all scripts:
 
 - **`MessageTypes`** — frozen object with every message string (e.g. `EXTRACT_PALETTE`, `APPLY_OVERRIDE_BULK`). Using this prevents typo-silent-failures.
-- **`PLConfig`** — numeric tuning parameters: `WEAKREF_PRUNE_INTERVAL_MS`, `SCAN_CACHE_TTL_MS`, `MAX_ELEMENTS`, etc.
-- **`PLLog`** — a thin logging facade (`PLLog.info`, `PLLog.debug`, `PLLog.warn`) that can be silenced in production.
+- **`PLConfig`** — numeric tuning parameters, including (non-exhaustive): `MAP_ELEMENT_LIMIT` (2000), `EXTRACTOR_BATCH_SIZE` (150), `WCAG_AA_CONTRAST` (4.5), `WEAKREF_PRUNE_INTERVAL_MS` (60000), `SCAN_CACHE_TTL_MS`, `MAX_ELEMENTS`, `BULK_APPLY_COOLDOWN_MS` (2000), `OBSERVER_DEBOUNCE_SMALL_MS` (200), `OBSERVER_DEBOUNCE_LARGE_MS` (400), `SPA_ROUTE_DEBOUNCE_MS` (600), `WATCHDOG_SLOW_MS` (10000), `WATCHDOG_FAST_MS` (5000), `SCROLL_REAPPLY_THROTTLE_MS` (1500), `HISTORY_LIMIT` (50), `DEFAULT_CLUSTER_TOLERANCE` (35), `DROPPER_Z_INDEX` (2147483645).
+- **`PLLog`** — a gated logging facade (`PLLog.info`, `PLLog.debug`, `PLLog.warn`, `PLLog.error`) with a `_debugEnabled` flag. Call `PLLog.enableDebug()` / `PLLog.disableDebug()` from DevTools to toggle verbose output. Debug logs are suppressed in production by default.
+
+### 8.7 ColorScience
+
+**File:** `utils/colorScience.js`
+
+Shared perceptual color math used by `popup.js` for clustering. **Not injected as a content script** — loaded directly by `popup.html` via a `<script>` tag.
+
+| Method | Description |
+| ------ | ----------- |
+| `hexToLab(hex)` | Converts `#rrggbb` → CIE LAB (`{ l, a, b }`) via D65 illuminant |
+| `ciede2000(lab1, lab2)` | CIEDE2000 ΔE₀₀ colour-difference (more perceptually uniform than CIE76 Euclidean) |
+| `hexToHsl(hex)` | Converts `#rrggbb` → `{ h, s, l }` (0–360, 0–1, 0–1) |
+| `channelToLinear(value)` | Linearizes a single sRGB channel (0–255) → linear-light (0–1) |
 
 ---
 
 ## 9. Message Bus (Full Message Type Reference)
 
-All messages use `chrome.runtime.sendMessage` (popup→background, sidepanel→background) or `chrome.tabs.sendMessage` (background→content).
+All messages use `chrome.runtime.sendMessage` (popup→background, sidepanel→background, sidepanel→popup direct) or `chrome.tabs.sendMessage` (background→content).
 
 ```
 Popup ──────────────────────────────────────────────────────────────► Content
-        EXTRACT_PALETTE, RESET_AND_RESCAN, RESCAN_ONLY
+        EXTRACT_PALETTE, RESET_AND_RESCAN, RESCAN_ONLY, RESET_STYLES
         APPLY_OVERRIDE, APPLY_OVERRIDE_BULK, REMOVE_RAW_OVERRIDE
         HIGHLIGHT_ELEMENTS, UNHIGHLIGHT
         PICK_COLOR, CANCEL_PICK
         FIX_TEXT_CONTRAST
-        SUSPEND_FOR_COMPARISON, RESTORE_AFTER_COMPARISON
+        SET_COLOR_SCHEME, SET_VISION_MODE
+        SUSPEND_FOR_COMPARISON, WAIT_FOR_PAINT, RESTORE_AFTER_COMPARISON
         SHOW_COMPARISON_OVERLAY, HIDE_COMPARISON_OVERLAY
         PAUSE_EXTENSION, RESUME_EXTENSION
-        FORCE_REAPPLY
+        FORCE_REAPPLY, APPLY_SAVED_PALETTE
 
 Popup ──────────────────────────────────────────────────────────────► Background
         OPEN_EDITOR_WINDOW
@@ -567,12 +615,19 @@ Dropper ────────────────────────
         DROPPER_RESOLVE_CLUSTER
         OPEN_EDITOR_WINDOW
 
-SidePanel ──────────────────────────────────────────────────────────► Background
+Content ────────────────────────────────────────────────────────────► Popup (runtime broadcast)
+        PL_COMPARISON_OVERLAY_CLOSED
+
+SidePanel ──────────────────────────────────────────────────────────► Background (relayed to content)
         SIDEPANEL_COLOR_CHANGED   (fast, no persist)
         SIDEPANEL_COLOR_COMMITTED (final, persists to storage)
         SIDEPANEL_APPLY_OVERRIDE
         SIDEPANEL_REMOVE_OVERRIDE
         SIDEPANEL_HIGHLIGHT
+
+SidePanel ──────────────────────────────────────────────────────────► Popup (direct, bypasses background)
+        SIDEPANEL_EXPORT_TOGGLED  (updates exportSelection set in popup)
+        SIDEPANEL_BATCH_APPLY     (applies picker color to all export-selected)
 
 Background ────────────────────────────────────────────────────────► Content
         APPLY_OVERRIDE_FAST, APPLY_OVERRIDE_BULK
@@ -591,10 +646,13 @@ Ephemeral — cleared when the browser closes.
 | -------------------------- | --------------------- | --------------------------------------------------------------------------- |
 | `activeEditorWindowId`     | background.js         | Tracks the open editor window so it can be focused instead of duplicated    |
 | `activeHeatmapWindowId`    | background.js         | Tracks the open heatmap window so it can be focused instead of duplicated   |
-| `sidePanelColorData`       | background.js         | Payload handed to the editor window on open                                 |
+| `sidePanelColorData`       | background.js         | Payload handed to the editor window on open; also watched via onChanged     |
 | `palettelive_heatmapTabId` | background.js         | Tab ID the heatmap window is targeting for refresh scans                    |
 | `palettelive_heatmapData`  | popup.js / heatmap.js | Pre-built color frequency array passed from popup; updated on refresh       |
 | `palettelive_clusterMap`   | popup.js              | Maps every member hex to its cluster entry so the dropper can resolve picks |
+| `palettelive_historyStack` | popup.js              | Undo history stack (up to 50 entries); persisted so close/reopen restores   |
+| `palettelive_redoStack`    | popup.js              | Redo history stack; cleared by any new action                               |
+| `palettelive_baselineScreenshot` | popup.js       | PNG data URL of the page before any overrides (used by comparison feature)  |
 
 ### Local Storage (`chrome.storage.local`)
 
@@ -616,6 +674,19 @@ Lost on page navigation or tab close.
 | `rawOverrideState`      | Active color substitutions                             |
 | `_scanCache`            | 2-minute TTL scan result cache                         |
 
+### In-Memory (popup.js)
+
+Lost when the popup window closes (but `historyStack` and `redoStack` survive via session storage).
+
+| Variable         | Purpose                                                    |
+| ---------------- | ---------------------------------------------------------- |
+| `currentColors`  | Last scan result palette array                             |
+| `overrideState`  | `Map<sourceHex, currentHex>` — active overrides            |
+| `exportSelection`| `Set<sourceHex>` — colors selected for export             |
+| `historyStack`   | Undo stack (persisted to session)                          |
+| `redoStack`      | Redo stack (persisted to session)                          |
+| `exportHistory`  | Last 10 exports (in-memory only)                           |
+
 ---
 
 ## 11. The Complete Scan → Edit → Export Flow
@@ -631,6 +702,8 @@ Lost on page navigation or tab close.
    └── if saved overrides exist, they are noted for re-application
 
 4. popup.js sends EXTRACT_PALETTE to content script (15 s timeout)
+   ├── If content script not responding: injectContentScripts() via chrome.scripting,
+   │     then waitForContentScriptReady(), then retry EXTRACT_PALETTE
    └── content.js receives message
 
 5. content.js checks _scanCache (url match + TTL)
@@ -645,8 +718,9 @@ Lost on page navigation or tab close.
    └── sends APPLY_OVERRIDE_BULK for each persisted raw override
 
 7. popup.js receives scan result
-   ├── clusterColors(colors, threshold) groups similar colors
+   ├── clusterColors(colors, threshold) groups similar colors using CIEDE2000 + alpha
    ├── Saves clusterMap to chrome.storage.session
+   ├── If no overrides active: captureBaseline() for comparison feature
    └── renderPalette() draws the swatch list
 
 8. USER clicks edit swatch button (pencil icon)
@@ -910,14 +984,16 @@ Phases run in sequence to ensure the content script receives one atomic bulk mes
 
 ### 13.1 Color Clustering
 
-Implemented entirely in `popup.js` via `clusterColors(colors, threshold)`.
+Implemented entirely in `popup.js` via `clusterPaletteColors(colors, threshold)` using the `ColorScience` module.
 
 Algorithm:
 
-1. Computes pairwise Lab ΔE distance between all colors (using `ColorUtils.colorDistance()`).
-2. Groups colors whose distance is ≤ `threshold` (0–30) into clusters using a greedy "union" approach.
-3. The most-used color in each cluster becomes the representative.
-4. The cluster map `{ memberHex → { sources, color, effectiveValues } }` is stored in `chrome.storage.session` for the dropper to look up.
+1. Converts all colors to CIE LAB (`ColorScience.hexToLab`) and extracts the alpha channel.
+2. Uses **CIEDE2000** (ΔE₀₀) for perceptual distance — more accurate than Euclidean RGB for detecting visually similar neutrals and grays.
+3. An **alpha penalty** (difference × 50) is added so semi-transparent variants (e.g. `#00000099` vs `#000000ff`) are not merged even when their RGB values are close.
+4. An **adaptive threshold** gives neutrals (low chroma, `chroma < 5`) a 30% looser tolerance so adjacent grays cluster more readily, while chromatic colors use the user-configured threshold as-is.
+5. Colors are sorted by usage count (descending) and greedily assigned to the nearest existing cluster. The cluster centroid is recomputed as a weighted average after each assignment.
+6. The cluster map `{ memberHex → { sources, color, effectiveValues } }` is stored in `chrome.storage.session` for the dropper to look up.
 
 When enabled, swatches show a "(N merged)" badge indicating how many colors are grouped.
 
@@ -966,10 +1042,15 @@ The split is implemented with CSS `clip-path` on a cloned layer, updated via `po
 
 ### 13.5 SPA / Infinite-Scroll Handling
 
-`content.js` attaches a `MutationObserver` to `document` watching for `childList` and `subtree` changes. Two scenarios are handled:
+`content.js` attaches a `MutationObserver` to `document` watching for `childList` and `subtree` changes. Three scenarios are handled:
 
-1. **Route change** (URL changes): Detected by comparing `location.href` before/after a batch of mutations. Triggers a full re-scan after style settle.
+1. **Route change** (URL changes): Detected by comparing `location.href` before/after a batch of mutations. Triggers a full re-scan after style settle. Debounced per `PLConfig.SPA_ROUTE_DEBOUNCE_MS` (600 ms).
 2. **New elements added** (infinite scroll): `processAddedSubtree(node)` scans new nodes and applies existing raw overrides to any newly matched colors.
+3. **Observer rate-limiting**: If the observer triggers more than `PLConfig.OBSERVER_MAX_RESCANS_PER_MIN` (30) times per minute it auto-pauses to prevent CPU runaway on heavily animated pages.
+
+**Override Watchdog:** An interval timer (`startOverrideWatchdog`) periodically samples a configurable number of overridden elements (`PLConfig.WATCHDOG_SAMPLE_LIMIT`) to detect "drift" — cases where site code removes PaletteLive inline styles. When drift is detected the watchdog interval shortens to `WATCHDOG_FAST_MS` (5 s) and re-applies overrides; after several consecutive no-drift ticks it relaxes back to `WATCHDOG_SLOW_MS` (10 s). The watchdog is suspended during heavy rescan operations and scroll handling.
+
+**Scroll Reapply:** A throttled/debounced scroll listener re-applies overrides to newly revealed elements during infinite scroll, using `PLConfig.SCROLL_REAPPLY_THROTTLE_MS` (1500 ms) and `SCROLL_REAPPLY_DEBOUNCE_MS` (500 ms).
 
 Dead element references are pruned from `colorElementMap` and `overrideRefs` during the 60-second `WeakRef` prune timer to prevent unbounded memory growth.
 
@@ -1009,12 +1090,13 @@ Generated palettes can be applied to the page (sends `APPLY_OVERRIDE_BULK`) or e
 | Corrupt storage data crash        | `StorageUtils._validatePaletteData` discards and removes invalid schemas on read                                                                                |
 | Extension context invalidation    | `safeSendRuntimeMessage` catches `"Extension context invalidated"` errors, sets `_plContextInvalidated = true`, and cleanly shuts down all timers and observers |
 | Runaway DOM walk                  | `ShadowWalker.MAX_ELEMENTS = 50000` hard cap; shadow recursion capped at depth 30                                                                               |
+| `chrome.storage.local.getBytesInUse` unavailable | Firefox does not support this API; `StorageUtils` avoids it and falls back to QUOTA_EXCEEDED error handling during `set()` calls              |
 
 ---
 
 ## 15. Error Recovery & Context Invalidation
 
-When Chrome updates or reloads the extension while a tab is open, the content script's extension context becomes invalid. Any further `chrome.runtime.*` calls throw `"Extension context invalidated"`.
+When Firefox updates or reloads the extension while a tab is open, the content script's extension context becomes invalid. Any further `chrome.runtime.*` calls throw `"Extension context invalidated"`.
 
 `content.js` handles this gracefully:
 
